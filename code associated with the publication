@@ -1,0 +1,1541 @@
+---
+title: "MR_NAFLD"
+author: "Zhipeng Liu"
+date: "8/7/2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,eval = T)
+```
+
+## Introduction 
+Aim of the study : Estimating the causal influence of NAFLD on T2D/metabolic traits/Obesity
+Method : two-sample Mendelian Randomization. 
+
+###Load the necessary packages and functions
+```{r}
+library(MendelianRandomization)
+library(MRPRESSO)
+library(meta)
+
+#functions to calculate the SE of log_odds_ratio
+SE_LnOR <- function(left_OR, right_OR){
+  (log(right_OR) - log(left_OR))/(1.96*2)
+}
+
+#function to calculate the 95% CI based on se
+CI_95 <- function(mean, se, OR=F){
+  L_95 <- mean - 1.96*se
+  U_95 <- mean + 1.96*se
+  if (OR == T){ #return the effect in the odds ratio scale
+    return(matrix(paste0(signif(exp(mean),2)," (",signif(exp(L_95),2),", ",signif(exp(U_95),2),")"),ncol  =1))
+  } else {
+    return(matrix(paste0(signif(mean,2)," (",signif(L_95,2),", ",signif(U_95,2),")"),ncol  =1))
+  }
+}
+
+
+
+#inverse normal transformation
+my_int <- function(x){
+  return(qnorm((rank(x,na.last="keep")-0.5)/sum(!is.na(x))))
+  
+}
+
+#function to uniform the allele used in both samples
+#a. set the alleles to be positively associated with risk factor (NAFLD)
+#b. flip the effect size of the second study by multiplying (-1) or reciprocal (1/OR) if different alleles were used in two studies. SE keeps the same.
+#c. report the palindromic SNPs (A/T, C/G), compare the allele frequency manually
+
+#`snp_flip` function is to flip the SNP expressed in different strand.e.g. AG and TC are the same SNP expressed in different strands.
+snp_flip <- function(snp){ 
+  snp <- tolower(snp)
+  dic <- list(a="t",t="a",c="g",g="c")
+  snp_alt <- paste(dic[[substr(snp,1,1)]],dic[[substr(snp,2,2)]],sep = "")
+  return(snp_alt)
+}
+
+#snp_reverse
+snp_reverse <- function(snp){
+  return(paste0(substr(snp,2,2),substr(snp,1,1)))
+}
+
+#`snp_parlindromic` is to test whether a SNP is parlindromic. e.g. AT or CG SNP
+snp_parlindromic <- function(allele1,allele2){
+  input <- paste(tolower(allele1),tolower(allele2),sep = "")
+  dic <- c("at","ta","cg","gc")
+  if (input %in% dic){
+    return(TRUE)
+  } else return(FALSE)
+}
+
+#function to uniform the snps used in both studies, for the case of palindromic snps, the default setting is to consider them to be from the same strand.
+#Note: Please make sure the order of the SNPs in two studies are the same
+#Note: effect size is expressed as log(OR) if it is a case-control study
+effect_allele_uniform <- function(effect_allele_study1,other_allele_study1, effect_allele_study2,other_allele_study2,effect_size_study2){
+  res <- data.frame(matrix(NA,nrow = length(effect_allele_study1),ncol = 5))
+  colnames(res) <- c("SNP_study1","SNP_study2","effect_size_study2_input","effect_size_study2_output","parlindromic")
+  unsure_snps <- rep(F,length(effect_allele_study1))
+  for (i in 1:length(effect_allele_study1)){
+    snp_study1 <- paste(tolower(effect_allele_study1[i]),tolower(other_allele_study1[i]),sep = "")
+    snp_study2 <- paste(tolower(effect_allele_study2[i]),tolower(other_allele_study2[i]),sep = "")
+    res[i,1] <- snp_study1
+    res[i,2] <- snp_study2
+    res[i,3] <- effect_size_study2[i]
+    
+    #First check the input SNPs are correct
+    if (!(snp_study1 %in% c(snp_study2,snp_flip(snp_study2),snp_reverse(snp_study2),snp_flip(snp_reverse(snp_study2))))){
+      stop("SNP infor in study 1 and study 2 are not matched! Please double-check!")
+    } else {
+      #Report the parlindromic SNPs, and uniform the effect allele if they are different in two studies
+      if (snp_parlindromic(effect_allele_study1[i],other_allele_study1[i])){
+        print(paste("The number",i,"snp in study 1 is a",toupper(snp_study1),"snp. Please check the allele frequency manually!"))
+        unsure_snps[i] <- T
+        if (snp_study1 == snp_study2){
+          effect_size_study2[i] <- effect_size_study2[i]
+        } else if (snp_study1 == snp_reverse(snp_study2)){
+          effect_size_study2[i] <- effect_size_study2[i] * (-1)
+        } else {
+          print("The SNPs in two studies are not match!")
+        }
+      } else {
+          if (snp_study1 %in% c(snp_study2,snp_flip(snp_study2))){
+            effect_size_study2[i] <- effect_size_study2[i]
+            } else if (snp_study1 %in% c(snp_reverse(snp_study2),snp_flip(snp_reverse(snp_study2)))){
+              effect_size_study2[i] <- effect_size_study2[i] * (-1)
+            } else {
+              print("The SNPs in two studies are not match!")
+            }
+          }
+    }
+  }
+  res[,4] <- effect_size_study2
+  res[,5] <- unsure_snps
+  return(res)
+}
+
+
+#check the weak instruments assumption, calculate the F statistics
+#F < 10 is usuallly considered to be weak
+MR_F <- function(sample_size,num_IVs,r_square){
+  numberator <- r_square * (sample_size - 1 - num_IVs)
+  denominator <- (1 - r_square) * num_IVs
+  f <- numberator / denominator
+  return(f)
+}
+
+#calcuated R^2 based on MAF and correlation
+#beta should be in standard deviation units. if not, should devide the sd
+#ref : https://journals.plos.org/plosone/article/file?type=supplementary&id=info:doi/10.1371/journal.pone.0120758.s001
+
+my_PVE <- function(beta, se_beta, maf, N){
+  numberator <- 2 * beta^2 * maf * (1 - maf)
+  denominator <- 2 * beta^2 * maf * (1 - maf) + se_beta^2 * 2 * N * maf * (1 - maf)
+  return(numberator/denominator)
+}
+
+
+lnOR_to_OR <- function(lnOR,se_lnOR){
+  return(c(exp(lnOR), exp(lnOR - 1.96 * se_lnOR), exp(lnOR + 1.96 * se_lnOR)))
+}
+
+### MR for single variant: ratio of coefficients method (Wald method), two-tailed z-test
+my_wald <- function(bx, by, bxse, byse, theta = 0){
+  ratio <- by/bx
+  se_ratio_approx = sqrt(byse^2/bx^2 + by^2*bxse^2/bx^4 - 2*theta*by/bx^3) # second order approximation
+  z_test <- ratio/se_ratio_approx
+  p <- 2*pnorm(-abs(z_test))
+  return(list("estimate" = ratio,"se" = se_ratio_approx,"p_value" = p))
+}
+
+
+#IVW function
+# theta is correlation between numerator and denominator in ratio estimate
+# theta = 0 in a two-sample setting
+my_IVW <- function(bx, by, bxse, byse, theta=0){
+     TE <- by/bx
+     seTe.first <- byse/bx
+     seTe.second <- sqrt(byse^2/bx^2 + by^2*bxse^2/bx^4 - 2*theta*by/bx^3)
+     # 1. Meta-analysis using first order approximation of se
+     betafirst.fixed = metagen(TE, seTe.first)$TE.fixed
+     sefirst.fixed = metagen(TE, seTe.first)$seTE.fixed
+     z_test.first <- betafirst.fixed/sefirst.fixed
+     p.first <- 2*pnorm(-abs(z_test.first))
+
+     # 2. Meta-analysis using second order approximation of se
+     betasecond.fixed = metagen(TE, seTe.second)$TE.fixed
+     sesecond.fixed = metagen(TE, seTe.second)$seTE.fixed
+     z_test.second <- betasecond.fixed/sesecond.fixed
+     p.second <- 2*pnorm(-abs(z_test.second))
+     # print("first")
+     # print(betafirst.fixed)
+     # print(sefirst.fixed)
+     # print(p.first)
+     # print("second")
+     # print(betasecond.fixed)
+     # print(sesecond.fixed)
+     # print(p.second)
+     return(list("estimate" = betasecond.fixed,"se" = sesecond.fixed,"p_value" = p.second))
+}
+
+#wrapper of the MR functions
+my_MR <- function(study1_effect, study1_se, study2_effect,study2_se,snps){
+  MRInputObject <- mr_input(bx = study1_effect,
+                          bxse = study1_se,
+                          by = study2_effect,
+                          byse = study2_se)
+  MRInputObject@snps <- as.character(snps)
+  #Inverse-variance method
+  IVWObject <- mr_ivw(MRInputObject,
+                    model = "default",
+                    robust = FALSE,
+                    penalized = FALSE,
+                    correl = FALSE,
+                    weights = "simple",
+                    psi = 0,
+                    distribution = "normal",
+                    alpha = 0.05)
+  #Median-based method
+  WeightedMedianObject <- mr_median(MRInputObject,
+                                  weighting = "weighted",
+                                  distribution = "normal",
+                                  alpha = 0.05,
+                                  iterations = 10000,
+                                  seed = 314159265)
+
+  #MR-Egger method
+  EggerObject <- mr_egger(MRInputObject,
+                        robust = FALSE,
+                        penalized = FALSE,
+                        correl = FALSE,
+                        distribution = "normal",
+                        alpha = 0.05)
+  return(list("MR_object" = MRInputObject, "IVW" = IVWObject, "WeightedMedian" = WeightedMedianObject, "MR_Egger"= EggerObject))
+}
+
+#summarise the restults
+my_res <- function(iv,risk_factor,traits,MR_df){
+  X_df <- MR_df[(MR_df$trait==risk_factor)&(MR_df$SNP %in% iv),]
+  estimate <- NULL
+  se <- NULL
+  p <- NULL
+  
+  for (trait in traits){
+    Y_df <- MR_df[(MR_df$trait==trait)&(MR_df$SNP %in% iv),]
+    ivw <- my_IVW(bx = X_df$Effect,by = Y_df$Effect,bxse = X_df$SE,byse = Y_df$SE)
+    estimate <- c(estimate,ivw$estimate)
+    se <- c(se,ivw$se)
+    p <- c(p,ivw$p_value)
+  } 
+   res <- cbind(estimate,se,p)
+   rownames(res) <- traits
+   return(res)
+}
+
+###Power of the study
+#https://cnsgenomics.shinyapps.io/mRnd/
+  
+###Functions for NAFLD as outcome
+#represent the results
+my_table_CI <- function(res){
+  return(cbind(CI_95(mean = res[,1],se = res[,2]), signif(res[,3],2),CI_95(mean = res[,4],se = GOLD_steatoisis[,5]), signif(res[,6],2),CI_95(mean = res[,7],se = res[,8]), signif(res[,9],2)))
+}
+
+###Functions for NAFLD as outcome
+effect_allele_uniform_2 <- function(effect_allele_study1,other_allele_study1,effect_size_study1, se_study1,snps_study1, effect_allele_freq_study1, nafld_dt){
+  #step 0: correct the data type of the input
+  effect_allele_study1 <- as.character(effect_allele_study1)
+  other_allele_study1 <- as.character(other_allele_study1)
+  effect_size_study1 <- as.numeric(as.character(effect_size_study1))
+  se_study1 <- as.numeric(as.character(se_study1))
+  snps_study1 <- as.character(snps_study1)
+  effect_allele_freq_study1 <- as.numeric(as.character(effect_allele_freq_study1))
+  
+  #step 1: set up the effect allele to be the exposure increasing allele
+  for (i in 1:length(effect_size_study1)){
+    if (effect_size_study1[i]<0){
+      swap_tmp <- effect_allele_study1[i]
+      effect_allele_study1[i] <- other_allele_study1[i]
+      other_allele_study1[i] <- swap_tmp
+      effect_size_study1[i] <- effect_size_study1[i] * (-1)
+      effect_allele_freq_study1[i] <- abs(effect_allele_freq_study1[i] - 1)
+    }
+  }
+  
+  #step 2: find the intersect of the two snp lists, proxy should be done before inputting into this function
+  overlapped_SNPS <- intersect(snps_study1,nafld_dt$SNPID)
+  study1_matched <- match(overlapped_SNPS,snps_study1)
+  nafld_dt <- nafld_dt[match(overlapped_SNPS,nafld_dt$SNPID),]
+  
+  effect_allele_study1 <- effect_allele_study1[study1_matched]
+  other_allele_study1 <- other_allele_study1[study1_matched]
+  effect_size_study1 <- effect_size_study1[study1_matched]
+  se_study1 <- se_study1[study1_matched]
+  snps_study1 <- snps_study1[study1_matched]
+  effect_allele_freq_study1 <- effect_allele_freq_study1[study1_matched]
+  
+  effect_allele_study2 <- nafld_dt$Allele2
+  other_allele_study2 <- nafld_dt$Allele1
+  effect_size_study2 <- nafld_dt$BETA
+  se_study2 <- nafld_dt$SE
+  snps_study2 <- nafld_dt$SNPID
+  effect_allele_freq_study2 <- nafld_dt$AF_Allele2
+  
+  #step 3: check the allele frequency for AT/CG snps
+  res <- data.frame(matrix(NA,nrow = length(effect_allele_study1),ncol = 12))
+  colnames(res) <- c("rsid_study1", "rsid_study2", "effect_size_study1","se_study1", "SNP_study1", "SNP_study2","effect_size_study2_input","effect_size_study2_output", "se_study2","parlindromic","multi_allelic_unmatched","effect_allele_freq_study1")
+  
+  unsure_snps <- rep("valid SNP",length(effect_allele_study1))
+  unmatched_snps <- rep(F,length(effect_allele_study1))
+
+  for (i in 1:length(effect_allele_study1)){
+    snp_study1 <- paste(tolower(effect_allele_study1[i]),tolower(other_allele_study1[i]),sep = "")
+    snp_study2 <- paste(tolower(effect_allele_study2[i]),tolower(other_allele_study2[i]),sep = "")
+    
+    res[i,5] <- snp_study1
+    res[i,6] <- snp_study2
+    res[i,7] <- effect_size_study2[i]
+    
+    #First check the input SNPs are correct
+    if (!(snp_study1 %in% c(snp_study2,snp_flip(snp_study2),snp_reverse(snp_study2),snp_flip(snp_reverse(snp_study2))))){
+      cat("SNP infor in study 1 and study 2 are not matched! Please double-check!")
+      unmatched_snps[i] <- T
+      
+    } else {
+      #Report the parlindromic SNPs, and uniform the effect allele if they are different in two studies
+      if (snp_parlindromic(effect_allele_study1[i],other_allele_study1[i])){
+        if ((effect_allele_freq_study1[i] > 0.42) & (effect_allele_freq_study1[i] < 0.58)){
+          unsure_snps[i] <- "ambiguious_parlindromicSNPs_discarded"
+        } else {
+          unsure_snps[i] <- "unambiguious_parlindromicSNPs"
+          cat_study1 <- ifelse(effect_allele_freq_study1[i]>0.5,"major","minor")
+          cat_study2 <- ifelse(effect_allele_freq_study2[i]>0.5,"major","minor")
+        
+          if ((snp_study1 == snp_study2) & (cat_study1==cat_study2)){
+            effect_size_study2[i] <- effect_size_study2[i]
+         } else if ((snp_study1 == snp_reverse(snp_study2)) & (cat_study1!=cat_study2)){
+          effect_size_study2[i] <- effect_size_study2[i] * (-1) 
+         } else {
+           unmatched_snps[i] <- T
+          print("The SNPs in two studies are not match!")
+         }
+      }
+    } else {
+          if (snp_study1 %in% c(snp_study2,snp_flip(snp_study2))){
+            effect_size_study2[i] <- effect_size_study2[i]
+            } else if (snp_study1 %in% c(snp_reverse(snp_study2),snp_flip(snp_reverse(snp_study2)))){
+              effect_size_study2[i] <- effect_size_study2[i] * (-1) 
+            } else {
+              unmatched_snps[i] <- T
+              print("The SNPs in two studies are not match!")
+            }
+          }
+    }
+  }
+
+  res[,1] <- snps_study1
+  res[,2] <- snps_study2
+  res[,3] <- effect_size_study1
+  res[,4] <- se_study1
+  res[,8] <- effect_size_study2
+  res[,9] <- se_study2
+  res[,10] <- unsure_snps
+  res[,11] <- unmatched_snps
+  res[,12] <- effect_allele_freq_study1
+  return(res)
+}
+
+#modified Q' statistics
+library(RadialMR)
+
+my_MR_2 <- function(mr_dt, NbDis_PRESSO = 2000, discard=T){
+  if (discard==T){
+    mr_dt <- mr_dt[(mr_dt$parlindromic!="ambiguious_parlindromicSNPs_discarded") & (mr_dt$multi_allelic_unmatched==F),]
+  } else {
+    mr_dt <- mr_dt
+  }
+  
+  ###stage 1: IVW, weighted median, and MR-egger
+  MRInputObject <- mr_input(bx = mr_dt$effect_size_study1,
+                          bxse = mr_dt$se_study1,
+                          by = mr_dt$effect_size_study2_output,
+                          byse = mr_dt$se_study2,
+                          snps = mr_dt$rsid_study1)
+  
+  #Inverse-variance method
+  IVWObject <- mr_ivw(MRInputObject,
+                    model = "fixed",
+                    robust = FALSE,
+                    penalized = FALSE,
+                    correl = FALSE,
+                    weights = "delta", #the variance expression is the second-order term from the delta expansion
+                    psi = 0,
+                    distribution = "normal",
+                    alpha = 0.05)
+  
+  #Median-based method
+  WeightedMedianObject <- mr_median(MRInputObject,
+                                  weighting = "weighted",
+                                  distribution = "normal",
+                                  alpha = 0.05,
+                                  iterations = 10000,
+                                  seed = 0805)
+
+  #MR-Egger method
+  EggerObject <- mr_egger(MRInputObject,
+                        robust = FALSE,
+                        penalized = FALSE,
+                        correl = FALSE,
+                        distribution = "normal",
+                        alpha = 0.05)
+  ###Stage 2: pletropic effects by MR-PRESSO global test
+  presso_dt <- as.data.frame(cbind(BetaOutcome = mr_dt$effect_size_study2_output, BetaExposure = mr_dt$effect_size_study1, SdOutcome = mr_dt$se_study2, SdExposure = mr_dt$se_study1))
+
+  MR_presso <- mr_presso(BetaOutcome = "BetaOutcome", BetaExposure = "BetaExposure", SdOutcome = "SdOutcome", SdExposure = "SdExposure", OUTLIERtest = TRUE, DISTORTIONtest = TRUE,NbDistribution = NbDis_PRESSO, data = presso_dt,SignifThreshold = 0.05,seed = 0805)
+
+  ###Stage 3: pletropic effects by modified Q' stat
+  radial_dt <- format_radial(BXG = mr_dt$effect_size_study1,BYG = mr_dt$effect_size_study2_output,seBXG = mr_dt$se_study1,seBYG = mr_dt$se_study2,RSID = mr_dt$rsid_study1)
+  IVW_radial <- ivw_radial(radial_dt,alpha = 0.05,weights = 3)
+  Egger_radial <- egger_radial(radial_dt,alpha = 0.05, weights = 3)
+  
+  return(list("mr_dt" = mr_dt, "MR_object" = MRInputObject, "IVW" = IVWObject, "WeightedMedian" = WeightedMedianObject, "MR_Egger"= EggerObject, "MR_presso" = MR_presso,"IVW_radial" = IVW_radial,"Egger_radial" = Egger_radial))
+}
+
+###function to re-run MR after removing the outlier SNPs
+my_MR_outlier_removed <- function(my_MR_2_obj){
+  outlier_id <- my_MR_2_obj$MR_presso$`MR-PRESSO results`$`Distortion Test`$`Outliers Indices`
+  if (!is.null(outlier_id)){
+    mr_dt_outlier_removed <- my_MR_2_obj$mr_dt[-outlier_id,]
+    return(my_MR_2(mr_dt = mr_dt_outlier_removed,discard = T))
+  }
+}
+```
+
+## Read the summary GWAS data
+
+In this study, we aim to compare the results of MR analysis in three groups: 1. PNPLA3 only; 2. NCAN (proxy of TM6SF2); 3, combination of PNPLA3 and TM6SF2
+
+The TM6SF2 rs58542926 SNP lies within 50kb of an NCAN gene variant (rs2228603 c.274 C4T, p.Pro92Ser) that has previously been associated with HTGC in another GWAS9,21. Both SNPs are in strong linkage disequilibrium (D' = 0.926, r^2 = 0.798). 
+
+```{r}
+load("~/Desktop/MendelianRandomization_BMI/Analysis/MR_NAFLD.RData")
+#########################################################################################################
+###NAFLD as exposure:
+######################################################################
+###Discovery stage: GOLD NAFLD with the largest possible GWAS dataset:
+######################################################################
+#NAFLD (steatosis): CT-measured hepatic steatosis in a meta-analysis of 7,176 individuals of European descent. [Speliotes et.al. 2011](http://journals.plos.org/plosgenetics/article?id=10.1371/journal.pgen.1001324) 
+#NAFLD (histologic): 592 subjects with biopsy-proven NAFLD from the NASH CRN, and 1,405 healthy controls from the MIGen study.
+#NAFLD (histologic II): 592 subjects with biopsy-proven NAFLD from the NASH CRN, and 3212 healthy controls from the MIGen study.
+#Instrumental variables
+ivs <- c("rs738409","rs2228603")
+###F statistics if IVS
+MR_F(sample_size = 7176,num_IVs = 1,r_square = 2.41/100)
+MR_F(sample_size = 7176,num_IVs = 1,r_square = 0.79/100)
+MR_F(sample_size = 7176,num_IVs = 2,r_square = 3.2/100)
+
+NAFLD_sig_45snps <- read.table("Data/NAFLD/NAFLD_sig_top45.csv",header = T,sep = ",")
+NAFLD_sig <- NAFLD_sig_45snps[match(ivs,NAFLD_sig_45snps$SNP),]
+NAFLD_sig$NAFLD_logOR <- log(NAFLD_sig$OR_NAFLD)
+NAFLD_sig$NAFLD_SE <- SE_LnOR(NAFLD_sig$OR_NAFLD_95L,NAFLD_sig$OR_NAFLD_95U)
+NAFLD_sig$NAFLD_logOR_2 <- log(NAFLD_sig$OR_NAFLD_2)
+NAFLD_sig$NAFLD_SE_2 <- SE_LnOR(NAFLD_sig$OR_NAFLD_95L_2,NAFLD_sig$OR_NAFLD_95U_2)
+
+MR_df <- rbind(as.matrix(NAFLD_sig[,8:10]),as.matrix(cbind(NAFLD_sig$NAFLD_logOR,NAFLD_sig$NAFLD_SE,NAFLD_sig$P_NAFLD)),as.matrix(cbind(NAFLD_sig$NAFLD_logOR_2,NAFLD_sig$NAFLD_SE_2,NAFLD_sig$P_NAFLD_2)))
+
+###############################################################################################
+###GWAS for T2D
+##Xue_2018 : We conducted a meta-analysis of genome-wide association studies (GWAS) with ~16 million genetic variants in 62,892 T2D cases and 596,424 controls of European ancestry, by combining three GWAS data sets: DIAbetes Genetics Replication And Meta-analysis (DIAGRAM), Genetic Epidemiology Research on Aging (GERA) and the full cohort release of the UK Biobank (UKB). 
+# • CHR: Chromosome
+# • BP: Base-pairs position (build 37)
+# • SNP: rsID
+# • A1: minor allele
+# • A2: major allele
+# • Frq_A1: allele frequency of A1
+# • b: effect size of A1
+# • se: standard error of b
+# • P: p-value
+# • N: sample size
+T2D <- read.table("Data/T2D/Xue_2018/NAFLD_sig/T2D_Xue_et_al_2018_NAFLD_sig.txt",header = T)
+
+tmp <- T2D[match(ivs,T2D$SNP),]
+effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$A1, other_allele_study2 = tmp$A2,effect_size_study2 = tmp$b)
+tmp$b <- effect$effect_size_study2_output
+
+MR_df <- rbind(MR_df,cbind(tmp$b,tmp$se,tmp$P))
+
+###DIAGRAM 2018 + UKBB
+#Aggregated GWAS results for 32 studies for 898,130 individuals (74,124 T2D cases and 824,006 controls) of European ancestry
+#   Chromosome and position (build 37, base-pairs).
+# o Effect (EA) and non-effect allele (NEA), aligned to the forward strand.
+# o Effect allele frequency (EAF).
+# o Log-odds ratio for the effect allele (Beta) and the corresponding standard error (SE).
+# o P-value for association (Pvalue).
+# o Total reported effective sample size (Neff) / total sample size for UK Biobank (N).
+
+#T2D
+T2D_2 <- read.table("Data/NAFLDasExposure/Mahajan.NatGenet2018b.T2D.European.nafld_3snps.txt",header = T)
+tmp <- T2D_2[-3,]
+effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$EA, other_allele_study2 = tmp$NEA,effect_size_study2 = tmp$Beta)
+tmp$Beta <- effect$effect_size_study2_output
+MR_df <- rbind(MR_df,cbind(tmp$Beta,tmp$SE,tmp$Pvalue))
+
+#T2D adjusted by BMI
+T2D_2_BMI <- read.table("Data/NAFLDasExposure/Mahajan.NatGenet2018b.T2Dbmiadj.European.nafld_3snps.txt",header = T)
+tmp <- T2D_2_BMI[-3,]
+effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$EA, other_allele_study2 = tmp$NEA,effect_size_study2 = tmp$Beta)
+tmp$Beta <- effect$effect_size_study2_output
+MR_df <- rbind(MR_df,cbind(tmp$Beta,tmp$SE,tmp$Pvalue))
+
+###############################################################################################
+#GWAS for BMI 
+#GIANT 2018 + UKBB
+## This describes the columns of the summary statistics generated in Yengo et al. (2018)
+## Meta-analysis of genome-wide association studies for height and body mass index in ~700,000 individuals of European ancestry
+# 
+# ----------------------
+# Columns description
+# ----------------------
+# 
+# SNP:                        RS ID
+# CHR:                        Chromosome
+# POS:                        Physical position (Genome build hg19)
+# Tested_Allele:              Allele corresponding to the effect size (BETA/BETA_COJO)
+# Other_Allele:               Other allele
+# Freq_Tested_Allele_in_HRS:  Frequency of the tested allele in the Health and Retirement Study (from 8,552 unrelated participants).
+# BETA:                       Marginal SNP effect size.
+# SE:                         Standard error of the effect size.
+# P:                          P-value measuring the significance of the marginal effect.
+# N:                          Sample size.
+# BETA_COJO:                  Conditional effect size from the software GCTA version 1.9 using HRS as linkage disequilibrium panel.
+# SE_COJO:                    Standard error of the conditional effect size.
+# P_COJO:                     P-value measuring the significance of the conditional effect.
+
+BMI <- read.table("Data/Obesity/2018_GIANT_and_UK_BioBank_Meta_Analysis/BMI/NAFLD_sig/Meta-analysis_BMI_Locke_et_al+UKBiobank_2018_UPDATED_NAFLD_sig.txt",header = T)
+
+tmp <- BMI[match(ivs,BMI$SNP),]
+effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$Tested_Allele, other_allele_study2 = tmp$Other_Allele,effect_size_study2 = tmp$BETA)
+tmp$BETA <- effect$effect_size_study2_output
+
+MR_df <- rbind(MR_df,cbind(tmp$BETA,tmp$SE,tmp$P))
+
+###BMI as in the GIANT + UKBB WHR analysis
+#"Meta-analysis of genome-wide association studies for body fat distribution in 694,649 individuals of European ancestry" Pulit, SL et al. bioRxiv, 2018. https://www.biorxiv.org/content/early/2018/04/18/304030
+BMI_2 <- read.table("Data/NAFLDasExposure/bmi.giant-ukbb.meta-analysis.combined.23May2018.nafld_3snps.txt",header = T)
+
+tmp <- BMI_2[match(ivs,BMI_2$SNP),]
+effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$Tested_Allele, other_allele_study2 = tmp$Other_Allele,effect_size_study2 = tmp$BETA)
+tmp$BETA <- effect$effect_size_study2_output
+
+MR_df <- rbind(MR_df,cbind(tmp$BETA,tmp$SE,tmp$P))
+
+###WHR in 2018 GIANT + UKBB analysis
+whr <- read.table("Data/NAFLDasExposure/whr.giant-ukbb.meta-analysis.combined.23May2018.nafld_3snps.txt",header = T)
+
+tmp <- whr[match(ivs,whr$SNP),]
+effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$Tested_Allele, other_allele_study2 = tmp$Other_Allele,effect_size_study2 = tmp$BETA)
+tmp$BETA <- effect$effect_size_study2_output
+
+MR_df <- rbind(MR_df,cbind(tmp$BETA,tmp$SE,tmp$P))
+
+###WHR adj BMI in 2018 GIANT + UKBB analysis
+whr_adi <- read.table("Data/NAFLDasExposure/whradjbmi.giant-ukbb.meta-analysis.combined.23May2018.nafld_3snps.txt",header = T)
+
+tmp <- whr_adi[match(ivs,whr_adi$SNP),]
+effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$Tested_Allele, other_allele_study2 = tmp$Other_Allele,effect_size_study2 = tmp$BETA)
+tmp$BETA <- effect$effect_size_study2_output
+
+MR_df <- rbind(MR_df,cbind(tmp$BETA,tmp$SE,tmp$P))
+
+###############################################################################################
+### GWAS for Glycaemic traits
+# HbA1c summary statistics (ancestry-specific and transethnic)
+# Glycated hemoglobin (HbA1c), used to monitor and diagnose diabetes, is influenced by average glycemia over a 2- to 3-month period and represents a longer-term indicator of glycemic status compared to fasting glucose (FG)
+# Ancestry-specific and transethnic genome-wide meta-analysis summary statistics for association with HbA1c in up to 159,940 individuals from 82 cohorts of European (N=123,665), African (N=7,564), East Asian (N=20,838) and South Asian (N=8,874) ancestry. HbA1c trait values are untransformed and adjusted for age, sex and study-specific covariates. File format details are provided in the accompanying README.
+# 
+# Please cite: Impact of common genetic determinants of Hemoglobin A1c on type 2 diabetes risk and diagnosis in ancestrally diverse populations: A transethnic genome-wide meta-analysis.Wheeler E et al.PLoS medicine 2017;14;9;e1002383
+
+# The columns in these files represent:
+# 
+# snp		SNP ID
+# chr		chromosome (NCBI build 36)
+# pos		position (NCBI build 36)
+# effect_allele		Effect allele
+# other_allele		Other (non-effect) allele
+# eaf_hapmap_pop		Frequency of A1 in HapMap rel 27 [pop: CEU (European results), YRI (African American results), CHB (East Asian results), GIH (South Asian results] 
+# beta		beta coefficient (effect size)
+# stderr		Standard error of beta coefficient
+# pvalue		p-value for testing effect size = 0
+# 
+HbA1c <- read.table("Data/T2D/MAGIC/HbA1c/Wheeleer_transethnic_2017/NAFLD_sig/HbA1c_METAL_European_NAFLD_sig.txt",header = T)
+
+tmp <- HbA1c[match(ivs,HbA1c$snp),]
+effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$effect_allele, other_allele_study2 = tmp$other_allele,effect_size_study2 = tmp$beta)
+tmp$beta <- effect$effect_size_study2_output
+
+MR_df <- rbind(MR_df,cbind(tmp$beta,tmp$stderr,tmp$pvalue))
+
+# Modified Stumvoll Insulin Sensitivity Index (ISI) datasets
+#ISI = 0.156-(0.0000459*insulin2hrs[pmol/L])-(0.000321*insulinfasting [pmol/L))- (0.0054* glucose2hrs [mmol/L])
+# Association with ISI was tested in three different models: Model 1 was adjusted for age and sex; Model 2 was adjusted for age, sex, and body mass index; and Model 3 analyzed the combined influence of the genotype effect adjusted for BMI and the interaction effect between the genotype and BMI on ISI (Model 3) as developed by Manning and colleagues. 
+# Results from the discovery effort are from up to 16,753 non-diabetic participants in Model 1 or from up to 16,735 non-diabetic participants in Models 2 and 3 from 7 studies. Replication was attempted for the 23 most significant novel loci in 13,354 independent individuals from 10 additional studies. The results of the replication and combined analysis of discovery and replication results are in the paper and its supplemental material. All participants were of white European ancestry from the United States or Europe and did not have diabetes.
+# 
+# Please cite: Genome-Wide Association Study of the Modified Stumvoll Insulin Sensitivity Index Identifies BCL2 and FAM19A2 as Novel Insulin Sensitivity Loci. Walford GA et al.Diabetes 2016;65;10;3200-11 PUBMED: 27416945; PMC: 5033262; DOI: 10.2337/db16-0199
+ISI_1 <- read.table("Data/T2D/MAGIC/Insulin_Sensitivity_Index/NAFLD_4loci/MAGIC_ISI_Model_1_AgeSexOnly_NAFLD_sig.txt",header = T)
+ISI_2 <- read.table("Data/T2D/MAGIC/Insulin_Sensitivity_Index/NAFLD_4loci/MAGIC_ISI_Model_2_AgeSexBMI_NAFLD_sig.txt",header = T)
+ISI_3 <- read.table("Data/T2D/MAGIC/Insulin_Sensitivity_Index/NAFLD_4loci/MAGIC_ISI_Model_3_JMA_NAFLD_sig.txt",header = T)
+
+#repeat the following code for ISI_1,2,3
+for (file in list(ISI_1,ISI_2,ISI_3)){
+  tmp <- file[match(ivs,file$snp),]
+
+  effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$effect_allele, other_allele_study2 = tmp$other_allele,effect_size_study2 = tmp$effect)
+  tmp$effect <- effect$effect_size_study2_output
+
+  MR_df <- rbind(MR_df,cbind(tmp$effect,tmp$stderr,tmp$pvalue))
+}
+
+
+### Insulin secretion during OGTT
+# Meta-analysis results files for glucose-stimulated insulin secretion (GSIS) indices during an oral glucose tolerance test in up to **5318 non-diabetic participants** from 9 cohorts.[Prokopenko et al.
+# PLoS genetics 2014](http://journals.plos.org/plosgenetics/article?id=10.1371/journal.pgen.1004235)
+
+# These files contain the association analysis results presented in the paper above (1). The GWAS discovery results for 9 traits from up to 7 cohorts are included in these files. Results from all traits are ln-transformed and are adjusted for age, sex, BMI and study-specific covariates. Meta-analysis files are filtered with MAF>1%, total samplesize >50%, and heterogeneity Cochrans Q-test_p-value > 0.0001.
+# Results for CIR are from up to 5,318, for CIRadjISI are from up to 4,789, for AUCIns/AUCGluc are from up to 4,213, for DI are from up to 5,130, for Increm30 are from up to 4,447, for Ins30 are from up to 4,483, for Ins30adjBMI are from up to 4,409, for AUCIns are from up to 4,324, and for ISI are from up to 4,769 non-diabetic participants.
+
+AUCins_AUCgluc <- read.table("Data/T2D/MAGIC/Insulin_secretion_during_OGTT/NAFLD_5loci/MAGIC_INSULIN_SECRETION_AUCins_AUCgluc_for_release_HMrel27_NAFLD_sig.txt",header = T)
+AUCins <-  read.table("Data/T2D/MAGIC/Insulin_secretion_during_OGTT/NAFLD_5loci/MAGIC_INSULIN_SECRETION_AUCins_for_release_HMrel27_NAFLD_sig.txt",header = T)
+CIR <- read.table("Data/T2D/MAGIC/Insulin_secretion_during_OGTT/NAFLD_5loci/MAGIC_INSULIN_SECRETION_CIR_for_release_HMrel27_NAFLD_sig.txt",header = T)
+CIR_ISI <- read.table("Data/T2D/MAGIC/Insulin_secretion_during_OGTT/NAFLD_5loci/MAGIC_INSULIN_SECRETION_CIR_ISI_for_release_HMrel27_NAFLD_sig.txt",header = T)
+DI <- read.table("Data/T2D/MAGIC/Insulin_secretion_during_OGTT/NAFLD_5loci/MAGIC_INSULIN_SECRETION_DI_for_release_HMrel27_NAFLD_sig.txt",header = T)
+Incr30 <- read.table("Data/T2D/MAGIC/Insulin_secretion_during_OGTT/NAFLD_5loci/MAGIC_INSULIN_SECRETION_Incr30_for_release_HMrel27_NAFLD_sig.txt",header = T)
+Ins30_BMI <- read.table("Data/T2D/MAGIC/Insulin_secretion_during_OGTT/NAFLD_5loci/MAGIC_INSULIN_SECRETION_Ins30_BMI_for_release_HMrel27_NAFLD_sig.txt",header = T)
+Ins30 <- read.table("Data/T2D/MAGIC/Insulin_secretion_during_OGTT/NAFLD_5loci/MAGIC_INSULIN_SECRETION_Ins30_for_release_HMrel27_NAFLD_sig.txt",header = T)
+ISI <- read.table("Data/T2D/MAGIC/Insulin_secretion_during_OGTT/NAFLD_5loci/MAGIC_INSULIN_SECRETION_ISI_for_release_HMrel27_NAFLD_sig.txt",header = T)
+
+#
+for (file in list(AUCins_AUCgluc,AUCins,CIR,CIR_ISI,DI,Incr30,Ins30_BMI,Ins30,ISI)){
+  tmp <- file[match(ivs,file$snp),]
+
+  effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$effect_allele, other_allele_study2 = tmp$other_allele,effect_size_study2 = tmp$effect)
+  tmp$effect <- effect$effect_size_study2_output
+
+  MR_df <- rbind(MR_df,cbind(tmp$effect,tmp$stderr,tmp$pvalue))
+}
+
+
+
+### Glucose and insulin results accounting for BMI
+# The glucose results are from an analysis of 29 studies in up to 58,074 non-diabetic participants and the insulin results are from an analysis of 26 studies in up to 51,750 non-diabetic participants.
+
+# Trait values for fasting insulin have been naturally log transformed. Fasting glucose (mmol/l) and BMI (kg/m2) values have not been transformed. The regression models included adjustment for age and sex as well as study-specific adjustments.
+
+# The two interaction analyses are (1) a meta-analysis of the interaction regression estimate β3 from a model Y=β0+β1*SNP+β2*BMI+β3*SNP*BMI and (2) the joint meta-analysis (JMA) of the β1 and β3 regression estimates which takes the covariance between these two estimates into account. The methodology for the JMA is described in Manning et al.
+
+#Ref: Manning AK et al. Nature Genetics 2012](https://www.nature.com/articles/ng.2274.pdf
+
+#At this moment, the interaction effects between SNP and BMI were not analysed for MR
+
+fastingGlu_main <- read.table("Data/T2D/MAGIC/Manning_insulin_and_glucose_adjBMI/NAFLD_5loci/MAGIC_Manning_et_al_FastingGlucose_MainEffect_NAFLD_sig.txt",header = T)
+lnfastingInsulin_main <- read.table("Data/T2D/MAGIC/Manning_insulin_and_glucose_adjBMI/NAFLD_5loci/MAGIC_Manning_et_al_lnFastingInsulin_MainEffect_NAFLD_sig.txt",header = T)
+# fastingGlu_interaction <- read.table("Data/T2D/MAGIC/Manning_insulin_and_glucose_adjBMI/NAFLD_5loci/MAGIC_Manning_et_al_FastingGlucose_Interaction_NAFLD_sig.txt",header = T)
+# lnfastingInsulin_interaction <- read.table("Data/T2D/MAGIC/Manning_insulin_and_glucose_adjBMI/NAFLD_5loci/MAGIC_Manning_et_al_lnFastingInsulin_Interaction_NAFLD_sig.txt",header = T)
+
+for (file in list(fastingGlu_main,lnfastingInsulin_main)){
+  
+  tmp <- file[match(ivs,file$Snp),]
+  
+  #not adjusted by BMI
+  effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$effect_allele, other_allele_study2 = tmp$other_allele,effect_size_study2 = tmp$MainEffects)
+  
+  tmp$MainEffects <- effect$effect_size_study2_output
+
+  MR_df <- rbind(MR_df,cbind(tmp$MainEffects,tmp$MainSE,tmp$MainP))
+  
+    #adjusted by BMI
+  effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$effect_allele, other_allele_study2 = tmp$other_allele,effect_size_study2 = tmp$BMIadjMainEffects)
+  
+  tmp$BMIadjMainEffects <- effect$effect_size_study2_output
+
+  MR_df <- rbind(MR_df,cbind(tmp$BMIadjMainEffects,tmp$BMIadjMainSE,tmp$BMIadjMainP))
+}
+
+
+### Fasting proinsulin datasets
+# The fasting proinsulin datasets were generated by a meta-analysis of GWAS data in **10,701 non-diabetic adults of European ancestry**. Fasting proinsulin values are adjusted for fasting insulin, age, sex and study-specific covariates
+
+#Ref: Genome-wide association identifies nine common variants associated with fasting proinsulin levels and provides new insights into the pathophysiology of type 2 diabetes. Strawbridge RJ et al. Diabetes 2011;60;10;2624-34.
+
+fasting_proinsulin <- read.table("Data/T2D/MAGIC/Fasting_proinsulin/NAFLD_5loci/MAGIC_ln_fastingProinsulin_NAFLD_sig.txt",header = T)
+
+tmp <- fasting_proinsulin[match(ivs,fasting_proinsulin$snp),]
+
+effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$effect_allele, other_allele_study2 = tmp$other_allele,effect_size_study2 = tmp$effect)
+
+tmp$effect <- effect$effect_size_study2_output
+
+MR_df <- rbind(MR_df,cbind(tmp$effect,tmp$stderr,tmp$pvalue))
+
+### 2hr glucose datasets
+# Glucose levels 2 h after an oral glucose challenge are a clinical measure of glucose tolerance used in the diagnosis of type 2 diabetes.
+
+# The 2hr glucose datasets were generated by a meta-analysis of nine GWAS in **15,234 non-diabetic individuals** and a follow-up of 29 independent loci in 6,958-30,620 individuals. Trait values for 2hr glucose are untramsformed and are adjusted for BMI in addition to age, sex and study-specific covariates
+
+#Ref:Saxena R et al.Nature genetics 2010](https://www.nature.com/articles/ng.521.pdf)
+
+glu_2h <- read.table("Data/T2D/MAGIC/2h_glucose/NAFLD_5loci/MAGIC_2hrGlucose_AdjustedForBMI_NAFLD_sig.txt",header = T)
+
+tmp <- glu_2h[match(ivs,glu_2h$snp),]
+
+effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$effect_allele, other_allele_study2 = tmp$other_allele,effect_size_study2 = tmp$effect)
+
+tmp$effect <- effect$effect_size_study2_output
+
+MR_df <- rbind(MR_df,cbind(tmp$effect,tmp$stderr,tmp$pvalue))
+
+### Fasting insulin and fasting glucose datasets
+# The fasting insulin and fasting glucose datasets were generated by performing a meta-analysis of up to 21 genome-wide association studies (GWAS) informative for fasting glucose, fasting insulin and indices of β-cell function (HOMA-B) and insulin resistance (HOMA-IR) in up to **46,186 non-diabetic participants**. 
+
+#Fasting glucose trait values are not transformed. Trait values for Fasting insulin, HOMA-IR, HOMA-B and fasting proinsulin have been naturally log transformed. All datasets are adjusted for age, sex and study-specific covariates. 
+
+#Ref: [Dupuis J et al.Nature genetics 2010](https://www.nature.com/articles/ng.520.pdf)
+
+fastingGlu_2010 <- read.table("Data/T2D/MAGIC/fasting_insulin_glucose_Dupuis_et_al/NAFLD_5loci/MAGIC_FastingGlucose_NAFLD_sig.txt",header = T)
+fasting_ln_insulin_2010 <- read.table("Data/T2D/MAGIC/fasting_insulin_glucose_Dupuis_et_al/NAFLD_5loci/MAGIC_ln_FastingInsulin_NAFLD_sig.txt",header = T)
+ln_HOMA_B_2010 <- read.table("Data/T2D/MAGIC/fasting_insulin_glucose_Dupuis_et_al/NAFLD_5loci/MAGIC_ln_HOMA-B_NAFLD_sig.txt",header = T)
+ln_HOMA_IR_2010 <- read.table("Data/T2D/MAGIC/fasting_insulin_glucose_Dupuis_et_al/NAFLD_5loci/MAGIC_ln_HOMA-IR_NAFLD_sig.txt",header = T)
+
+for (file in list(fastingGlu_2010,fasting_ln_insulin_2010,ln_HOMA_B_2010,ln_HOMA_IR_2010)){
+  tmp <- file[match(ivs,file$snp),]
+
+  effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$effect_allele, other_allele_study2 = tmp$other_allele,effect_size_study2 = tmp$effect)
+  tmp$effect <- effect$effect_size_study2_output
+
+  MR_df <- rbind(MR_df,cbind(tmp$effect,tmp$stderr,tmp$pvalue))
+}
+
+###Lipids by GPGC
+#188,577 individuals
+# SNP_hg18	Marker name in build hg18.
+# SNP_hg19	Marker name in build hg19.
+# rsid	Marker name in rsid format.
+# A1	Effect allele.
+# A2	Other allele.
+# Beta	Effect size.
+# SE	Standard Error for Beta.
+# N	The number of individuals analyzed for this marker.
+# P-value	P-value after doing genomic control.
+# Freq.A1.1000G.EUR	Frequency of allele A1 from 1000G EUR sample.
+HDL <- read.table("Data/NAFLDasExposure/jointGwasMc_HDL.nafld_3snps.txt",header = T)
+LDL <- read.table("Data/NAFLDasExposure/jointGwasMc_LDL.nafld_3snps.txt",header = T)
+TC <- read.table("Data/NAFLDasExposure/jointGwasMc_TC.nafld_3snps.txt",header = T)
+TG <- read.table("Data/NAFLDasExposure/jointGwasMc_TG.nafld_3snps.txt",header = T)
+
+for (file in list(HDL,LDL,TC,TG)){
+  tmp <- file[-3,]
+
+  effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$A1, other_allele_study2 = tmp$A2,effect_size_study2 = tmp$beta)
+  tmp$beta <- effect$effect_size_study2_output
+
+  MR_df <- rbind(MR_df,cbind(tmp$beta,tmp$se,tmp$P.value))
+}
+
+###Leptin
+#32,161 individuals
+leptin <- read.table("Data/NAFLDasExposure/Leptin_Not_Adjusted_for_BMI.nafld_3snps.txt",header = T)
+leptin_bmiadj <- read.table("Data/NAFLDasExposure/Leptin_Adjusted_for_BMI.nafld_3snps.txt",header = T)
+
+for (file in list(leptin,leptin_bmiadj)){
+  tmp <- file[match(ivs,file$SNP),]
+
+  effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$Effect_all, other_allele_study2 = tmp$Other_all,effect_size_study2 = tmp$Effect)
+  tmp$Effect <- effect$effect_size_study2_output
+
+  MR_df <- rbind(MR_df,cbind(tmp$Effect,tmp$StdErr,tmp$P))
+}
+
+###Adiponectin
+#Novel Loci for Adiponectin Levels and Their Influence on Type 2 Diabetes and Metabolic Traits: A Multi-Ethnic Meta-Analysis of 45,891 Individuals
+#reference allele is the effect allele
+
+adiponectin <- read.table("Data/NAFLDasExposure/adipogen.discovery.eur_.meta_.public.release.nafld_3snps.txt",header = T)
+
+tmp <- adiponectin[match(ivs,adiponectin$marker),]
+
+effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$reference_allele, other_allele_study2 = tmp$other_allele,effect_size_study2 = tmp$beta)
+tmp$beta <- effect$effect_size_study2_output
+
+MR_df <- rbind(MR_df,cbind(tmp$beta,tmp$se,tmp$pvalue))
+
+###################################################################################################
+###validation data set
+###################################################################################################
+#NAFLD in UKBB
+# CHR: chromosome
+# POS: genome position 
+# SNPID: variant ID
+# Allele1: Ref allele
+# Allele2: Alt allele
+# AC_Allele2: allele count of Alt allele
+# AF_Allele2: allele frequency of Alt allele
+# N: sample size
+# BETA: effect size
+# SE: standard error of BETA
+# Tstat: score statistic
+# p.value: p value with SPA applied
+# p.value.NA: p value when SPA is not applied
+# Is.SPA.converge: whether SPA is converged or not
+# varT: estimated variance of score statistic with sample relatedness incorporated
+# varTstar: variance of score statistic without sample relatedness incorporated
+nafld_ukbb <- read.table("Data/NAFLDasExposure/NAFLD_ALL_SAIGE.nafld_3snps.txt",header = T)
+
+tmp <- nafld_ukbb[match(ivs,nafld_ukbb$SNPID),]
+
+effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$Allele2, other_allele_study2 = tmp$Allele1,effect_size_study2 = tmp$BETA)
+
+tmp$BETA <- effect$effect_size_study2_output
+
+MR_df <- rbind(MR_df,cbind(tmp$BETA,tmp$SE,tmp$p.value))
+
+###T2D at 2017 DIAGRAM without UKBB samples
+# 26,676 T2D cases and 132,532 control participants from 18 GWAS. 
+# 1. Chromosome and position (build 37, bp)
+# 2. Allele 1 and Allele 2 (aligned to the forward strand)
+# 3. P-value for association
+# 4. Effect for the Allele 1 and corresponding Standard Error 5. Number of cases and controls reported
+
+#without BMI adj
+T2D_2017 <- read.table("Data/NAFLDasExposure/METAANALYSIS_DIAGRAM_SE1.5e-08.rsidupdated.nafld_3snps.txt",header = T)
+
+tmp <- T2D_2017[-3,]
+
+effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$Allele1, other_allele_study2 = tmp$Allele2,effect_size_study2 = tmp$Effect)
+
+tmp$Effect <- effect$effect_size_study2_output
+
+MR_df <- rbind(MR_df,cbind(tmp$Effect,tmp$StdErr,tmp$P.value))
+
+#BMI adj
+T2D_2017_bmiadj <- read.table("Data/NAFLDasExposure/METAANALYSIS_DIAGRAM_SE1_BMI.5e-08.rsidupdated.nafld_3snps.txt",header = T)
+
+tmp <- T2D_2017_bmiadj[-3,]
+
+effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$Allele1, other_allele_study2 = tmp$Allele2,effect_size_study2 = tmp$Effect)
+
+tmp$Effect <- effect$effect_size_study2_output
+
+MR_df <- rbind(MR_df,cbind(tmp$Effect,tmp$StdErr,tmp$P.value))
+
+###Waist: 2015 GIANT
+#HIP without adj BMI
+hip <- read.table("Data/NAFLDasExposure/GIANT_2015_HIP_COMBINED_EUR.nafld_3snps.txt",header = T)
+hip_bmiadj <- read.table("Data/NAFLDasExposure/GIANT_2015_HIPadjBMI_COMBINED_EUR.nafld_3snps.txt",header = T)
+wc <- read.table("Data/NAFLDasExposure/GIANT_2015_WC_COMBINED_EUR.nafld_3snps.txt",header = T)
+wc_bmiadj <- read.table("Data/NAFLDasExposure/GIANT_2015_WCadjBMI_COMBINED_EUR.nafld_3snps.txt",header = T)
+whr <- read.table("Data/NAFLDasExposure/GIANT_2015_WHR_COMBINED_EUR.nafld_3snps.txt",header = T) 
+whr_adj <- read.table("Data/NAFLDasExposure/GIANT_2015_WHRadjBMI_COMBINED_EUR.nafld_3snps.txt",header = T)
+
+for (file in list(hip, hip_bmiadj,wc, wc_bmiadj, whr, whr_adj)){
+  tmp <- file[match(ivs,file$MarkerName),]
+
+  effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$Allele1, other_allele_study2 = tmp$Allele2,effect_size_study2 = tmp$b)
+  tmp$b <- effect$effect_size_study2_output
+
+  MR_df <- rbind(MR_df,cbind(tmp$b,tmp$se,tmp$p))
+}
+
+###BMI: 2015 GIANT 
+BMI_2015 <- read.table("Data/NAFLDasExposure/BMI_2015_GIANT.nafld_3snps.txt",header = T)
+
+tmp <- BMI_2015[match(ivs,BMI_2015$SNP),]
+
+effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$A1, other_allele_study2 = tmp$A2,effect_size_study2 = tmp$b)
+tmp$b <- effect$effect_size_study2_output
+
+MR_df <- rbind(MR_df,cbind(tmp$b,tmp$se,tmp$p))
+
+###UKBB : T2d from the collorator
+T2D_UKBB <- read.table("Data/NAFLDasExposure/T2D_ALL_SAIGE.nafld_3snps.txt",header = T)
+
+tmp <- T2D_UKBB[match(ivs,T2D_UKBB$SNPID),]
+
+effect <- effect_allele_uniform(effect_allele_study1 = NAFLD_sig$EA,other_allele_study1 = NAFLD_sig$OA,effect_allele_study2 = tmp$Allele2, other_allele_study2 = tmp$Allele1,effect_size_study2 = tmp$BETA)
+tmp$BETA <- effect$effect_size_study2_output
+
+MR_df <- rbind(MR_df,cbind(tmp$BETA,tmp$SE,tmp$p.value))
+
+#################################################################################################
+###Combine all the datasets
+traits = c("steatosis","NAFLD_1","NAFLD_2","T2D_xue","T2D_2018DIAGRAM","T2D_2018DIAGRAM_BMIadj","BMI_2018GIANT","BMI_2018GIANT_WHR","WHR_2018GIANT","WHR_2018GIANT_bmiadj","HbA1c","ISI_1","ISI_2","ISI_3","AUCins_AUCgluc","AUCins","CIR","CIR_ISI","DI","Incr30","Ins30_BMI","Ins30","ISI","fastingGlu_main","fastingGlu_main_adjBMI","lnfastingInsulin_main","lnfastingInsulin_main_adjBMI","fasting_proinsulin","glu_2h","fastingGlu_2010","fasting_ln_insulin_2010","ln_HOMA_B_2010","ln_HOMA_IR_2010","HDL","LDL","TC","TG","leptin","leptin_bmiadj","adiponectin","nafld_ukbb","t2d_2017DIAGRAM","t2d_2017DIAGRAM_BMIadj","hip_2015GIANT","hip_2015GIANT_BMIadj","wc_2015GIANT","wc_2015GIANT_BMIadj","whr_2015GIANT","whr_2015GIANT_BMIadj","BMI_2015GIANT","T2D_UKBB")
+
+nafld_as_exposure <- cbind(do.call(rbind,replicate(length(traits), NAFLD_sig[, c(1:7,11)],simplify = F)),trait = rep(traits,each = 2), MR_df)
+```
+
+### MR analysis with NAFLD as exposure
+
+```{r}
+#GOLD: Steatosis as risk factor(PNPLA3, NCAN, PNPLA3+NCAN)
+GOLD_steatoisis <- cbind(my_res(iv = ivs[1],risk_factor = "steatosis",traits = traits,MR_df = nafld_as_exposure),my_res(iv = ivs[2],risk_factor = "steatosis",traits = traits,MR_df = nafld_as_exposure),my_res(iv = ivs,risk_factor = "steatosis",traits = traits,MR_df = nafld_as_exposure))
+
+#GOLD NAFLD as risk factor(PNPLA3, NCAN, PNPLA3+NCAN)
+GOLD_NAFLD <- cbind(my_res(iv = ivs[1],risk_factor = "NAFLD_1",traits = traits, MR_df = nafld_as_exposure),my_res(iv = ivs[2],risk_factor = "NAFLD_1",traits = traits,MR_df = nafld_as_exposure),my_res(iv = ivs,risk_factor = "NAFLD_1",traits = traits,MR_df = nafld_as_exposure))
+
+#UKBB NAFLD as risk factor(PNPLA3, NCAN, PNPLA3+NCAN)
+UKBB_NAFLD <- cbind(my_res(iv = ivs[1],risk_factor = "nafld_ukbb",traits = traits,MR_df = nafld_as_exposure),my_res(iv = ivs[2],risk_factor = "nafld_ukbb",traits = traits,MR_df = nafld_as_exposure),my_res(iv = ivs,risk_factor = "nafld_ukbb",traits = traits,MR_df = nafld_as_exposure))
+
+
+##summary for supplemental table 2
+
+# T2DM (DIAGRAM/GERA/UKB)
+# Glycemic traits (MAGIC)
+# HbA1c (%)
+# Stumvoll ISI (ISI_2)
+# Fasting glucose (mg/dL)
+# Log fasting insulin (pmol/L)
+# Log fasting proinsulin (pmol/L)
+# 2h glucose (mg/dL)
+# Log HOMA-IR
+# Log HOMA-B
+# BMI (kg/m2) (GIANT/UKB)
+
+
+
+GOLD_steatoisis_CI <- my_table_CI(GOLD_steatoisis)
+GOLD_NAFLD_CI <- my_table_CI(GOLD_NAFLD)
+UKBB_NAFLD_CI <- my_table_CI(UKBB_NAFLD)
+
+a <- cbind(GOLD_steatoisis_CI,GOLD_NAFLD_CI)
+
+```
+
+### NAFLD as outcome
+```{r}
+###t2d_2017DIAGRAM
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/METAANALYSIS_DIAGRAM_SE1.5e-08.rsidupdated.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.METAANALYSIS_DIAGRAM_SE1.5e-08.rsidupdated.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$Allele1,other_allele_study1 = a$Allele2,effect_size_study1 = a$Effect,se_study1 = a$StdErr,snps_study1 = a$rsid,effect_allele_freq_study1 = rep(0.5,length(a$Allele1)),nafld_dt = b)
+
+t2d_2017DIAGRAM <- my_MR_2(mr_dt = tmp,discard  = T)
+
+###t2d_2017DIAGRAM_BMIadj
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/METAANALYSIS_DIAGRAM_SE1_BMI.5e-08.rsidupdated.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.METAANALYSIS_DIAGRAM_SE1_BMI.5e-08.rsidupdated.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$Allele1,other_allele_study1 = a$Allele2,effect_size_study1 = a$Effect,se_study1 = a$StdErr,snps_study1 = a$rsid,effect_allele_freq_study1 = rep(0.5,length(a$Allele1)),nafld_dt = b)
+
+t2d_2017DIAGRAM_BMIadj <- my_MR_2(mr_dt = tmp,discard = T)
+
+#hip_2015GIANT
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/GIANT_2015_HIP_COMBINED_EUR.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.GIANT_2015_HIP_COMBINED_EUR.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$Allele1,other_allele_study1 = a$Allele2,effect_size_study1 = a$b,se_study1 = a$se,snps_study1 = a$MarkerName,effect_allele_freq_study1 = a$FreqAllele1HapMapCEU,nafld_dt = b)
+
+hip_2015GIANT <- my_MR_2(mr_dt = tmp,T)
+
+#hip_2015GIANT_BMIadj
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/GIANT_2015_HIPadjBMI_COMBINED_EUR.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.GIANT_2015_HIPadjBMI_COMBINED_EUR.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$Allele1,other_allele_study1 = a$Allele2,effect_size_study1 = a$b,se_study1 = a$se,snps_study1 = a$MarkerName,effect_allele_freq_study1 = a$FreqAllele1HapMapCEU,nafld_dt = b)
+
+hip_2015GIANT_BMIadj <- my_MR_2(mr_dt = tmp,T)
+
+#wc_2015GIANT
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/GIANT_2015_WC_COMBINED_EUR.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.GIANT_2015_WC_COMBINED_EUR.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$Allele1,other_allele_study1 = a$Allele2,effect_size_study1 = a$b,se_study1 = a$se,snps_study1 = a$MarkerName,effect_allele_freq_study1 = a$FreqAllele1HapMapCEU, nafld_dt = b)
+
+wc_2015GIANT <- my_MR_2(mr_dt = tmp,T)
+
+#wc_2015GIANT_BMIadj
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/GIANT_2015_WCadjBMI_COMBINED_EUR.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.GIANT_2015_WCadjBMI_COMBINED_EUR.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$Allele1,other_allele_study1 = a$Allele2,effect_size_study1 = a$b,se_study1 = a$se,snps_study1 = a$MarkerName,effect_allele_freq_study1 = a$FreqAllele1HapMapCEU,nafld_dt = b)
+
+wc_2015GIANT_BMIadj <- my_MR_2(mr_dt = tmp,discard =  T)
+
+#whr_2015GIANT
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/GIANT_2015_WHR_COMBINED_EUR.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.GIANT_2015_WHR_COMBINED_EUR.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$Allele1,other_allele_study1 = a$Allele2,effect_size_study1 = a$b,se_study1 = a$se,snps_study1 = a$MarkerName,effect_allele_freq_study1 = a$FreqAllele1HapMapCEU,nafld_dt = b)
+
+whr_2015GIANT <- my_MR_2(mr_dt = tmp,discard = T)
+
+#whr_2015GIANT_BMIadj
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/GIANT_2015_WHRadjBMI_COMBINED_EUR.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.GIANT_2015_WHRadjBMI_COMBINED_EUR.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$Allele1,other_allele_study1 = a$Allele2,effect_size_study1 = a$b,se_study1 = a$se,snps_study1 = a$MarkerName,effect_allele_freq_study1 = a$FreqAllele1HapMapCEU,nafld_dt = b)
+
+whr_2015GIANT_BMIadj <- my_MR_2(mr_dt = tmp,discard = T)
+
+#BMI_2015GIANT
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/BMI_2015_GIANT.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.BMI_2015_GIANT.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$A1,other_allele_study1 = a$A2,effect_size_study1 = a$b,se_study1 = a$se,snps_study1 = a$SNP,effect_allele_freq_study1 = a$Freq1.Hapmap,nafld_dt = b)
+
+BMI_2015GIANT <- my_MR_2(mr_dt = tmp,discard = T)
+
+#HbA1c
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/HbA1c_METAL_European.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.HbA1c_METAL_European.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$effect_allele,other_allele_study1 = a$other_allele,effect_size_study1 = a$beta,se_study1 = a$stderr,snps_study1 = a$snp,effect_allele_freq_study1 = a$eaf_hapmap_CEU,nafld_dt = b)
+
+HbA1c <- my_MR_2(mr_dt = tmp,discard = T)
+
+#ISI_1 : no significant snps
+
+#ISI_2 : only one significant snp
+
+#ISI_3:
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/MAGIC_ISI_Model_3_JMA.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.MAGIC_ISI_Model_3_JMA.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$effect_allele,other_allele_study1 = a$other_allele,effect_size_study1 = a$effect,se_study1 = a$stderr,snps_study1 = a$snp,effect_allele_freq_study1 = rep(0.5,length(a$effect_allele)),nafld_dt = b)
+
+ISI_3 <- my_MR_2(mr_dt = tmp,discard = T)
+
+#"AUCins_AUCgluc","AUCins","CIR","CIR_ISI","DI","Incr30","Ins30_BMI","Ins30","ISI" : no significant snps
+
+#manning: "fastingGlu_main" without adj BMI
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/MAGIC_Manning_et_al_FastingGlucose_MainEffect.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.MAGIC_Manning_et_al_FastingGlucose_MainEffect.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$effect_allele,other_allele_study1 = a$other_allele,effect_size_study1 = a$MainEffects,se_study1 = a$MainSE,snps_study1 = a$Snp,effect_allele_freq_study1 = rep(0.5,length(a$effect_allele)),nafld_dt = b)
+
+fastingGlu_main <- my_MR_2(mr_dt = tmp,discard = T)
+
+#manning: "lnfastingInsulin_main" : not enough significant snps
+
+#manning: "fastingGlu_main_adjBMI"
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/MAGIC_Manning_et_al_FastingGlucose_BMIadj_MainEffect.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.MAGIC_Manning_et_al_FastingGlucose_BMIadj_MainEffect.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$effect_allele,other_allele_study1 = a$other_allele,effect_size_study1 = a$BMIadjMainEffects,se_study1 = a$BMIadjMainSE,snps_study1 = a$Snp,effect_allele_freq_study1 = rep(0.5,length(a$effect_allele)),nafld_dt = b)
+
+fastingGlu_main_adjBMI <- my_MR_2(mr_dt = tmp,discard = T)
+
+#"lnfastingInsulin_main_adjBMI"
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/MAGIC_Manning_et_al_lnFastingInsulin_BMIadj_MainEffect.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.MAGIC_Manning_et_al_lnFastingInsulin_BMIadj_MainEffect.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$effect_allele,other_allele_study1 = a$other_allele,effect_size_study1 = a$BMIadjMainEffects,se_study1 = a$BMIadjMainSE,snps_study1 = a$Snp,effect_allele_freq_study1 = rep(0.5,length(a$effect_allele)),nafld_dt = b)
+
+lnfastingInsulin_main_adjBMI <- my_MR_2(mr_dt = tmp,discard = T,NbDis_PRESSO = 5000)
+
+#fasting_proinsulin
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/MAGIC_ln_fastingProinsulin.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.MAGIC_ln_fastingProinsulin.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$effect_allele,other_allele_study1 = a$other_allele,effect_size_study1 = a$effect,se_study1 = a$stderr,snps_study1 = a$snp,effect_allele_freq_study1 = rep(0.5,length(a$effect_allele)),nafld_dt = b)
+
+fasting_proinsulin <- my_MR_2(mr_dt = tmp,discard = T,NbDis_PRESSO = 5000)
+
+#glu_2h: only one significant snp
+
+#fastingGlu_2010
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/MAGIC_FastingGlucose.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.MAGIC_FastingGlucose.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$effect_allele,other_allele_study1 = a$other_allele,effect_size_study1 = a$effect,se_study1 = a$stderr,snps_study1 = a$snp,effect_allele_freq_study1 = rep(0.5,length(a$effect_allele)),nafld_dt = b)
+
+fastingGlu_2010 <- my_MR_2(mr_dt = tmp,discard =  T)
+
+#fasting_ln_insulin_2010 : no significant snps
+
+#ln_HOMA_B_2010 : not enough significant snps 
+
+#ln_HOMA_IR_2010 : no significant snps
+
+#HDL
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/jointGwasMc_HDL.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.jointGwasMc_HDL.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$A1,other_allele_study1 = a$A2,effect_size_study1 = a$beta,se_study1 = a$se,snps_study1 = a$rsid,effect_allele_freq_study1 = ifelse(is.na(a$Freq.A1.1000G.EUR),0.5,a$Freq.A1.1000G.EUR),nafld_dt = b)
+
+HDL <- my_MR_2(mr_dt = tmp,discard =  T,NbDis_PRESSO = 5000)
+
+#LDL
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/jointGwasMc_LDL.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.jointGwasMc_LDL.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$A1,other_allele_study1 = a$A2,effect_size_study1 = a$beta,se_study1 = a$se,snps_study1 = a$rsid,effect_allele_freq_study1 = ifelse(is.na(a$Freq.A1.1000G.EUR),0.5,a$Freq.A1.1000G.EUR), nafld_dt = b)
+
+LDL <- my_MR_2(mr_dt = tmp,discard = T,NbDis_PRESSO = 5000)
+
+#TC
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/jointGwasMc_TC.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.jointGwasMc_TC.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$A1,other_allele_study1 = a$A2,effect_size_study1 = a$beta,se_study1 = a$se,snps_study1 = a$rsid,effect_allele_freq_study1 = ifelse(is.na(a$Freq.A1.1000G.EUR),0.5,a$Freq.A1.1000G.EUR), nafld_dt = b)
+
+TC <- my_MR_2(mr_dt = tmp,discard = T,NbDis_PRESSO = 5000)
+
+#TG
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/jointGwasMc_TG.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.jointGwasMc_TG.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$A1,other_allele_study1 = a$A2,effect_size_study1 = a$beta,se_study1 = a$se,snps_study1 = a$rsid,effect_allele_freq_study1 = ifelse(is.na(a$Freq.A1.1000G.EUR),0.5,a$Freq.A1.1000G.EUR), nafld_dt = b)
+
+TG <- my_MR_2(mr_dt = tmp,discard = T,NbDis_PRESSO = 5000)
+
+#leptin without BMI adj: no sig snps found
+
+#leptin_bmiadj : only 2 signficant snps
+
+#adiponectin
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/adipogen.discovery.eur_.meta_.public.release.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.adipogen.discovery.eur_.meta_.public.release.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$reference_allele,other_allele_study1 = a$other_allele,effect_size_study1 = a$beta,se_study1 = a$se,snps_study1 = a$marker,effect_allele_freq_study1 = rep(0.5,length(a$reference_allele)),nafld_dt = b)
+
+adiponectin <- my_MR_2(mr_dt = tmp,discard = T)
+
+###add the additional test:
+# BMI_2018GIANT_WHR
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/bmi.giant-ukbb.meta-analysis.combined.23May2018.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.bmi.giant-ukbb.meta-analysis.combined.23May2018.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$Tested_Allele,other_allele_study1 = a$Other_Allele,effect_size_study1 = a$BETA,se_study1 = a$SE,snps_study1 = a$SNP,effect_allele_freq_study1 = a$Freq_Tested_Allele,nafld_dt = b)
+
+BMI_2018GIANT_WHR <- my_MR_2(mr_dt = tmp,discard = T,NbDis_PRESSO = 5000)
+
+# WHR_2018GIANT
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/whr.giant-ukbb.meta-analysis.combined.23May2018.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.whr.giant-ukbb.meta-analysis.combined.23May2018.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$Tested_Allele,other_allele_study1 = a$Other_Allele,effect_size_study1 = a$BETA,se_study1 = a$SE,snps_study1 = a$SNP,effect_allele_freq_study1 = a$Freq_Tested_Allele,nafld_dt = b)
+
+WHR_2018GIANT <- my_MR_2(mr_dt = tmp,discard = T)
+# WHR_2018GIANT_bmiadj
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/whradjbmi.giant-ukbb.meta-analysis.combined.23May2018.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.whradjbmi.giant-ukbb.meta-analysis.combined.23May2018.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$Tested_Allele,other_allele_study1 = a$Other_Allele,effect_size_study1 = a$BETA,se_study1 = a$SE,snps_study1 = a$SNP,effect_allele_freq_study1 = a$Freq_Tested_Allele,nafld_dt = b)
+
+WHR_2018GIANT_bmiadj <- my_MR_2(mr_dt = tmp,discard = T)
+
+# T2D_2018DIAGRAM
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/Mahajan.NatGenet2018b.T2D.European.5e-08.rsidupdated.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.Mahajan.NatGenet2018b.T2D.European.5e-08.rsidupdated.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$EA,other_allele_study1 = a$NEA,effect_size_study1 = a$Beta,se_study1 = a$SE,snps_study1 = a$rsid,effect_allele_freq_study1 = a$EAF,nafld_dt = b)
+
+T2D_2018DIAGRAM <- my_MR_2(mr_dt = tmp,discard = T)
+
+# T2D_2018DIAGRAM_BMIadj
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/Mahajan.NatGenet2018b.T2Dbmiadj.European.5e-08.rsidupdated.5e-08.clumpedSTAT.txt",header = T)
+
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.Mahajan.NatGenet2018b.T2Dbmiadj.European.5e-08.rsidupdated.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$EA,other_allele_study1 = a$NEA,effect_size_study1 = a$Beta,se_study1 = a$SE,snps_study1 = a$rsid,effect_allele_freq_study1 = a$EAF,nafld_dt = b)
+
+T2D_2018DIAGRAM_BMIadj <- my_MR_2(mr_dt = tmp,discard = T,NbDis_PRESSO = 5000)
+
+##add the exposures that have limited significant IVs
+#ISI_2 : only one significant snp, use the ward test instead
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/MAGIC_ISI_Model_2_AgeSexBMI.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.MAGIC_ISI_Model_2_AgeSexBMI.5e-08.clumpedSTAT.txt",header = T)
+b$Allele2 <- "T"
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$effect_allele,other_allele_study1 = a$other_allele,effect_size_study1 = a$effect,se_study1 = a$stderr,snps_study1 = a$snp,effect_allele_freq_study1 = rep(0.5,length(a$effect_allele)),nafld_dt = b)
+
+ISI_2 <- my_IVW(bx = tmp$effect_size_study1,by = tmp$effect_size_study2_output,bxse = tmp$se_study1,byse = tmp$se_study2)
+
+#lnfastingInsulin_main
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/MAGIC_Manning_et_al_lnFastingInsulin_MainEffect.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.MAGIC_Manning_et_al_lnFastingInsulin_MainEffect.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$effect_allele,other_allele_study1 = a$other_allele,effect_size_study1 = a$MainEffects,se_study1 = a$MainSE,snps_study1 = a$Snp,effect_allele_freq_study1 = rep(0.5,length(a$effect_allele)),nafld_dt = b)
+
+lnfastingInsulin_main <- my_IVW(bx = tmp$effect_size_study1,by = tmp$effect_size_study2_output,bxse = tmp$se_study1,byse = tmp$se_study2)
+
+#glu_2h
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/MAGIC_2hrGlucose_AdjustedForBMI.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.MAGIC_2hrGlucose_AdjustedForBMI.5e-08.clumpedSTAT.txt",header = T)
+b$Allele1 <- "T"
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$effect_allele,other_allele_study1 = a$other_allele,effect_size_study1 = a$effect,se_study1 = a$stderr,snps_study1 = a$snp,effect_allele_freq_study1 = rep(0.5,length(a$effect_allele)),nafld_dt = b)
+
+glu_2h <- my_IVW(bx = tmp$effect_size_study1,by = tmp$effect_size_study2_output,bxse = tmp$se_study1,byse = tmp$se_study2)
+
+#ln_HOMA_B_2010
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/MAGIC_ln_HOMA-B.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.MAGIC_ln_HOMA-B.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$effect_allele,other_allele_study1 = a$other_allele,effect_size_study1 = a$effect,se_study1 = a$stderr,snps_study1 = a$snp,effect_allele_freq_study1 = rep(0.5,length(a$effect_allele)),nafld_dt = b)
+tmp <- tmp[(tmp$parlindromic=="valid SNP"),]
+
+ln_HOMA_B_2010 <- my_IVW(bx = tmp$effect_size_study1,by = tmp$effect_size_study2_output,bxse = tmp$se_study1,byse = tmp$se_study2)
+
+
+#leptin_bmiadj
+a <- read.table("Data/NAFLDasOutcome/clumpedSTAT/Leptin_Adjusted_for_BMI.5e-08.clumpedSTAT.txt",header = T)
+b <- read.table("Data/NAFLDasOutcome/NAFLD/nafld.Leptin_Adjusted_for_BMI.5e-08.clumpedSTAT.txt",header = T)
+
+tmp <- effect_allele_uniform_2(effect_allele_study1 = a$Effect_all,other_allele_study1 = a$Other_all,effect_size_study1 = a$Effect,se_study1 = a$StdErr,snps_study1 = a$SNP,effect_allele_freq_study1 = rep(0.5,length(a$Effect_all)),nafld_dt = b)
+tmp <- tmp[(tmp$parlindromic=="valid SNP"),]
+
+
+leptin_bmiadj <- my_IVW(bx = tmp$effect_size_study1,by = tmp$effect_size_study2_output,bxse = tmp$se_study1,byse = tmp$se_study2)
+
+
+###summary the results of part I : estimated by all methods
+files <- list(t2d_2017DIAGRAM,t2d_2017DIAGRAM_BMIadj,hip_2015GIANT,hip_2015GIANT_BMIadj,wc_2015GIANT,wc_2015GIANT_BMIadj,whr_2015GIANT,whr_2015GIANT_BMIadj,BMI_2015GIANT,HbA1c,ISI_3,fastingGlu_main,fastingGlu_main_adjBMI,lnfastingInsulin_main_adjBMI,fasting_proinsulin,fastingGlu_2010,HDL,LDL,TC,TG,adiponectin,BMI_2018GIANT_WHR,WHR_2018GIANT,WHR_2018GIANT_bmiadj,T2D_2018DIAGRAM,T2D_2018DIAGRAM_BMIadj)
+
+nafld_as_outcome <- as.data.frame(matrix(0,nrow = length(files),ncol = 31))
+
+colnames(nafld_as_outcome) <- c("ivw_estimate","ivw_sd","ivw_p","weighted_median_estimate","weighted_median_sd","weighted_median_p","egger_estimate","egger_sd","egger_p","egger_int_estimate","egger_int_sd","egger_int_p","presso_raw_estimate","presso_raw_sd","presso_raw_p","presso_corrected_estimate","presso_corrected_sd","presso_corrected_p","presso_global_p","ivw_radial_estimate","ivw_radial_sd","ivw_radial_p","ivw_radial_modifiedQ_Pvalue","egger_radial_estimate","egger_radial_sd","egger_radial_p","egger_int_estimate_radial","egger_int_sd_radial","egger_int_p_radial","egger_radial_rucker_Pvalue","n_IVs")
+
+rownames(nafld_as_outcome) <- c("t2d_2017DIAGRAM","t2d_2017DIAGRAM_BMIadj","hip_2015GIANT","hip_2015GIANT_BMIadj","wc_2015GIANT","wc_2015GIANT_BMIadj","whr_2015GIANT","whr_2015GIANT_BMIadj","BMI_2015GIANT","HbA1c","ISI_3","fastingGlu_main","fastingGlu_main_adjBMI","lnfastingInsulin_main_adjBMI","fasting_proinsulin","fastingGlu_2010","HDL","LDL","TC","TG","adiponectin","BMI_2018GIANT_WHR","WHR_2018GIANT","WHR_2018GIANT_bmiadj","T2D_2018DIAGRAM","T2D_2018DIAGRAM_BMIadj")
+
+i = 1
+for (file in files){
+  ivw <- c(file$IVW@Estimate,file$IVW@StdError,file$IVW@Pvalue)
+  weighted_median <- c(file$WeightedMedian@Estimate,file$WeightedMedian@StdError,file$WeightedMedian@Pvalue)
+  egger_est <- c(file$MR_Egger@Estimate,file$MR_Egger@StdError.Est,file$MR_Egger@Pvalue.Est)
+  egger_int <- c(file$MR_Egger@Intercept,file$MR_Egger@StdError.Int,file$MR_Egger@Pvalue.Int)
+  mr_presso_raw <- c(file$MR_presso$`Main MR results`$`Causal Estimate`[1],file$MR_presso$`Main MR results`$Sd[1],file$MR_presso$`Main MR results`$`P-value`[1])
+  mr_presso_corrected <- c(file$MR_presso$`Main MR results`$`Causal Estimate`[2],file$MR_presso$`Main MR results`$Sd[2],file$MR_presso$`Main MR results`$`P-value`[2])
+  mr_pressor_global_p <- file$MR_presso$`MR-PRESSO results`$`Global Test`$Pvalue
+  ivw_radial <- c(file$IVW_radial$coef[1],file$IVW_radial$coef[2],file$IVW_radial$coef[4],pchisq(q = file$IVW_radial$qstatistic,df = file$IVW_radial$df,lower.tail = F))
+  egger_est_radial <- c(file$Egger_radial$coef[2,1],file$Egger_radial$coef[2,2],file$Egger_radial$coef[2,4])
+  egger_int_radial <- c(file$Egger_radial$coef[1,1],file$Egger_radial$coef[1,2],file$Egger_radial$coef[1,4])
+  egger_radial_rucker_Pvalue <- pchisq(q = file$Egger_radial$qstatistic,df = file$Egger_radial$df,lower.tail = F)
+  n_IVs <- length(file$MR_object@snps)
+  
+  nafld_as_outcome[i,] <- c(ivw,weighted_median,egger_est,egger_int,mr_presso_raw,mr_presso_corrected,mr_pressor_global_p,ivw_radial,egger_est_radial, egger_int_radial,egger_radial_rucker_Pvalue,n_IVs)
+  i = i + 1
+}
+
+###summary the results of part II : estimated only by Wald/IVW
+nafld_as_outcome2 <- as.data.frame(matrix(NA,nrow = length(files2),ncol = 31))
+files2 <- list(ISI_2,lnfastingInsulin_main,glu_2h,ln_HOMA_B_2010,leptin_bmiadj)
+
+colnames(nafld_as_outcome2) <- c("ivw_estimate","ivw_sd","ivw_p","weighted_median_estimate","weighted_median_sd","weighted_median_p","egger_estimate","egger_sd","egger_p","egger_int_estimate","egger_int_sd","egger_int_p","presso_raw_estimate","presso_raw_sd","presso_raw_p","presso_corrected_estimate","presso_corrected_sd","presso_corrected_p","presso_global_p","ivw_radial_estimate","ivw_radial_sd","ivw_radial_p","ivw_radial_modifiedQ_Pvalue","egger_radial_estimate","egger_radial_sd","egger_radial_p","egger_int_estimate_radial","egger_int_sd_radial","egger_int_p_radial","egger_radial_rucker_Pvalue","n_IVs")
+
+rownames(nafld_as_outcome2) <- c("ISI_2","lnfastingInsulin_main","glu_2h","ln_HOMA_B_2010","leptin_bmiadj")
+i = 1
+for (file in files2) {
+  nafld_as_outcome2[i,] <- c(file$estimate, file$se, file$p_value,rep(NA,28))
+  i = i + 1
+}
+
+nafld_as_outcome <- rbind(nafld_as_outcome,nafld_as_outcome2)
+nafld_as_outcome <- as.data.frame(data.matrix(nafld_as_outcome))
+
+#represent the results 
+nafld_as_outcome_CI <- as.data.frame(cbind(CI_95(mean = nafld_as_outcome[,1],se = nafld_as_outcome[,2]),nafld_as_outcome[,3],CI_95(mean = nafld_as_outcome[,4],se = nafld_as_outcome[,5]),nafld_as_outcome[,6],CI_95(mean = nafld_as_outcome[,7],se = nafld_as_outcome[,8]),nafld_as_outcome[,9],CI_95(mean = nafld_as_outcome[,10],se = nafld_as_outcome[,11]),nafld_as_outcome[,12],CI_95(mean = nafld_as_outcome[,13],se = nafld_as_outcome[,14]),nafld_as_outcome[,15],CI_95(mean = nafld_as_outcome[,16],se = nafld_as_outcome[,17]),nafld_as_outcome[,18],nafld_as_outcome[,19],CI_95(mean = nafld_as_outcome[,20],se = nafld_as_outcome[,21]),nafld_as_outcome[,22],nafld_as_outcome[,23],CI_95(mean = nafld_as_outcome[,24],se = nafld_as_outcome[,25]),nafld_as_outcome[,26],CI_95(mean = nafld_as_outcome[,27],se = nafld_as_outcome[,28]),nafld_as_outcome[,29],nafld_as_outcome[,30],nafld_as_outcome[,31]))
+rownames(nafld_as_outcome_CI) <- rownames(nafld_as_outcome)
+colnames(nafld_as_outcome_CI) <- colnames(nafld_as_outcome)[-c(2,5,8,11,14,17,21,25,28)]
+
+###calucate the variance explained and F statistics 
+library(haploR)
+
+files <- list(t2d_2017DIAGRAM,t2d_2017DIAGRAM_BMIadj,hip_2015GIANT,hip_2015GIANT_BMIadj,wc_2015GIANT,wc_2015GIANT_BMIadj,whr_2015GIANT,whr_2015GIANT_BMIadj,BMI_2015GIANT,HbA1c,ISI_3,fastingGlu_main,fastingGlu_main_adjBMI,lnfastingInsulin_main_adjBMI,fasting_proinsulin,fastingGlu_2010,HDL,LDL,TC,TG,adiponectin,BMI_2018GIANT_WHR,WHR_2018GIANT,WHR_2018GIANT_bmiadj,T2D_2018DIAGRAM,T2D_2018DIAGRAM_BMIadj)
+
+PVE_res <- as.data.frame(matrix(0,ncol = 4, nrow = length(files)))
+colnames(PVE_res) <- c("nIVs","N","R^2","F")
+total_sample_size <- c(159208,159208,224459,224459,224459,224459,224459,224459,339224,123665,16735,58074,58074,51750,10701,46186,188577,188577,188577,188577,39883,806834,697734,694649,898130,898130)
+
+
+i = 1
+for (file in files){
+  n_IVs <- length(file$MR_object@snps)
+  a <- queryHaploreg(query = file$MR_object@snps,ldThresh = NA)
+  b <- a[match(file$MR_object@snps,a$rsID),]
+  c <- sum(my_PVE(beta = file$MR_object@betaX,se_beta = file$MR_object@betaXse,maf = b$EUR,N = total_sample_size[i]),na.rm = T)
+  d <- MR_F(sample_size = total_sample_size[i], num_IVs = n_IVs,r_square = c)
+  
+  PVE_res[i,1] <- n_IVs
+  PVE_res[i,2] <- total_sample_size[i]
+  PVE_res[i,3] <- c
+  PVE_res[i,4] <- d
+  i = i + 1
+}
+
+rownames(PVE_res) <- c("t2d_2017DIAGRAM","t2d_2017DIAGRAM_BMIadj","hip_2015GIANT","hip_2015GIANT_BMIadj","wc_2015GIANT","wc_2015GIANT_BMIadj","whr_2015GIANT","whr_2015GIANT_BMIadj","BMI_2015GIANT","HbA1c","ISI_3","fastingGlu_main","fastingGlu_main_adjBMI","lnfastingInsulin_main_adjBMI","fasting_proinsulin","fastingGlu_2010","HDL","LDL","TC","TG","adiponectin","BMI_2018GIANT_WHR","WHR_2018GIANT","WHR_2018GIANT_bmiadj","T2D_2018DIAGRAM","T2D_2018DIAGRAM_BMIadj")
+
+#############################################
+###re-run the MR estiate after removing the outlier SNPs by MR-PRESSO
+T2D_2018DIAGRAM_BMIadj_withoutOutlier <- my_MR_outlier_removed(T2D_2018DIAGRAM_BMIadj)
+lnfastingInsulin_main_adjBMI_withoutOutlier <- my_MR_outlier_removed(lnfastingInsulin_main_adjBMI)
+BMI_2018GIANT_WHR_withoutOutlier <- my_MR_outlier_removed(BMI_2018GIANT_WHR) #outlier remains
+HDL_withoutOutlier <- my_MR_outlier_removed(HDL)
+LDL_withoutOutlier <- my_MR_outlier_removed(LDL)#outlier remains
+TC_withoutOutlier <- my_MR_outlier_removed(TC)
+TG_withoutOutlier <- my_MR_outlier_removed(TG)
+
+#summarize the results of re-fit MR
+files_withoutOutlier <- list(T2D_2018DIAGRAM_BMIadj_withoutOutlier,lnfastingInsulin_main_adjBMI_withoutOutlier,BMI_2018GIANT_WHR_withoutOutlier, HDL_withoutOutlier, LDL_withoutOutlier, TC_withoutOutlier, TG_withoutOutlier)
+
+nafld_as_outcome_withoutOutlier <- as.data.frame(matrix(0,nrow = length(files_withoutOutlier),ncol = 31))
+
+colnames(nafld_as_outcome_withoutOutlier) <- c("ivw_estimate","ivw_sd","ivw_p","weighted_median_estimate","weighted_median_sd","weighted_median_p","egger_estimate","egger_sd","egger_p","egger_int_estimate","egger_int_sd","egger_int_p","presso_raw_estimate","presso_raw_sd","presso_raw_p","presso_corrected_estimate","presso_corrected_sd","presso_corrected_p","presso_global_p","ivw_radial_estimate","ivw_radial_sd","ivw_radial_p","ivw_radial_modifiedQ_Pvalue","egger_radial_estimate","egger_radial_sd","egger_radial_p","egger_int_estimate_radial","egger_int_sd_radial","egger_int_p_radial","egger_radial_rucker_Pvalue","n_IVs")
+
+rownames(nafld_as_outcome_withoutOutlier) <- c("T2D_2018DIAGRAM_BMIadj_withoutOutlier","lnfastingInsulin_main_adjBMI_withoutOutlier","BMI_2018GIANT_WHR_withoutOutlier", "HDL_withoutOutlier", "LDL_withoutOutlier", "TC_withoutOutlier", "TG_withoutOutlier")
+
+i = 1
+for (file in files_withoutOutlier){
+  ivw <- c(file$IVW@Estimate,file$IVW@StdError,file$IVW@Pvalue)
+  weighted_median <- c(file$WeightedMedian@Estimate,file$WeightedMedian@StdError,file$WeightedMedian@Pvalue)
+  egger_est <- c(file$MR_Egger@Estimate,file$MR_Egger@StdError.Est,file$MR_Egger@Pvalue.Est)
+  egger_int <- c(file$MR_Egger@Intercept,file$MR_Egger@StdError.Int,file$MR_Egger@Pvalue.Int)
+  mr_presso_raw <- c(file$MR_presso$`Main MR results`$`Causal Estimate`[1],file$MR_presso$`Main MR results`$Sd[1],file$MR_presso$`Main MR results`$`P-value`[1])
+  mr_presso_corrected <- c(file$MR_presso$`Main MR results`$`Causal Estimate`[2],file$MR_presso$`Main MR results`$Sd[2],file$MR_presso$`Main MR results`$`P-value`[2])
+  mr_pressor_global_p <- file$MR_presso$`MR-PRESSO results`$`Global Test`$Pvalue
+  ivw_radial <- c(file$IVW_radial$coef[1],file$IVW_radial$coef[2],file$IVW_radial$coef[4],pchisq(q = file$IVW_radial$qstatistic,df = file$IVW_radial$df,lower.tail = F))
+  egger_est_radial <- c(file$Egger_radial$coef[2,1],file$Egger_radial$coef[2,2],file$Egger_radial$coef[2,4])
+  egger_int_radial <- c(file$Egger_radial$coef[1,1],file$Egger_radial$coef[1,2],file$Egger_radial$coef[1,4])
+  egger_radial_rucker_Pvalue <- pchisq(q = file$Egger_radial$qstatistic,df = file$Egger_radial$df,lower.tail = F)
+  n_IVs <- length(file$MR_object@snps)
+  
+  nafld_as_outcome_withoutOutlier[i,] <- c(ivw,weighted_median,egger_est,egger_int,mr_presso_raw,mr_presso_corrected,mr_pressor_global_p,ivw_radial,egger_est_radial, egger_int_radial,egger_radial_rucker_Pvalue,n_IVs)
+  i = i + 1
+}
+nafld_as_outcome_withoutOutlier <- data.matrix(nafld_as_outcome_withoutOutlier)
+
+#represent the results 
+nafld_as_outcome_withoutOutlier_CI <- as.data.frame(cbind(CI_95(mean = nafld_as_outcome_withoutOutlier[,1],se = nafld_as_outcome_withoutOutlier[,2],OR = T),nafld_as_outcome_withoutOutlier[,3],CI_95(mean = nafld_as_outcome_withoutOutlier[,4],se = nafld_as_outcome_withoutOutlier[,5],OR = T),nafld_as_outcome_withoutOutlier[,6],CI_95(mean = nafld_as_outcome_withoutOutlier[,7],se = nafld_as_outcome_withoutOutlier[,8],OR = T),nafld_as_outcome_withoutOutlier[,9],CI_95(mean = nafld_as_outcome_withoutOutlier[,10],se = nafld_as_outcome_withoutOutlier[,11],OR = T),nafld_as_outcome_withoutOutlier[,12],CI_95(mean = nafld_as_outcome_withoutOutlier[,13],se = nafld_as_outcome_withoutOutlier[,14],OR = T),nafld_as_outcome_withoutOutlier[,15],CI_95(mean = nafld_as_outcome_withoutOutlier[,16],se = nafld_as_outcome_withoutOutlier[,17],OR = T),nafld_as_outcome_withoutOutlier[,18],nafld_as_outcome_withoutOutlier[,19],CI_95(mean = nafld_as_outcome_withoutOutlier[,20],se = nafld_as_outcome_withoutOutlier[,21],OR = T),nafld_as_outcome_withoutOutlier[,22],nafld_as_outcome_withoutOutlier[,23],CI_95(mean = nafld_as_outcome_withoutOutlier[,24],se = nafld_as_outcome_withoutOutlier[,25],OR = T),nafld_as_outcome_withoutOutlier[,26],CI_95(mean = nafld_as_outcome_withoutOutlier[,27],se = nafld_as_outcome_withoutOutlier[,28],OR = T),nafld_as_outcome_withoutOutlier[,29],nafld_as_outcome_withoutOutlier[,30],nafld_as_outcome_withoutOutlier[,31]))
+
+rownames(nafld_as_outcome_withoutOutlier_CI) <- rownames(nafld_as_outcome_withoutOutlier)
+colnames(nafld_as_outcome_withoutOutlier_CI) <- colnames(nafld_as_outcome_withoutOutlier)[-c(2,5,8,11,14,17,21,25,28)]
+
+###calucate the variance explained and F statistics 
+library(haploR)
+
+files <- list(T2D_2018DIAGRAM_BMIadj_withoutOutlier,lnfastingInsulin_main_adjBMI_withoutOutlier,BMI_2018GIANT_WHR_withoutOutlier, HDL_withoutOutlier, LDL_withoutOutlier, TC_withoutOutlier, TG_withoutOutlier)
+
+PVE_res <- as.data.frame(matrix(0,ncol = 4, nrow = length(files)))
+colnames(PVE_res) <- c("nIVs","N","R^2","F")
+total_sample_size <- c(898130,51750,806834,188577,188577,188577,188577)
+  
+
+
+
+
+i = 1
+for (file in files){
+  n_IVs <- length(file$MR_object@snps)
+  a <- queryHaploreg(query = file$MR_object@snps,ldThresh = NA)
+  b <- a[match(file$MR_object@snps,a$rsID),]
+  c <- sum(my_PVE(beta = file$MR_object@betaX,se_beta = file$MR_object@betaXse,maf = b$EUR,N = total_sample_size[i]),na.rm = T)
+  d <- MR_F(sample_size = total_sample_size[i], num_IVs = n_IVs,r_square = c)
+  
+  PVE_res[i,1] <- n_IVs
+  PVE_res[i,2] <- total_sample_size[i]
+  PVE_res[i,3] <- c
+  PVE_res[i,4] <- d
+  print(i)
+  i = i + 1
+}
+
+rownames(PVE_res) <- c("T2D_2018DIAGRAM_BMIadj_withoutOutlier","lnfastingInsulin_main_adjBMI_withoutOutlier","BMI_2018GIANT_WHR_withoutOutlier", "HDL_withoutOutlier", "LDL_withoutOutlier", "TC_withoutOutlier", "TG_withoutOutlier")
+
+
+
+```
+
+
+## Transgenetic mice experiments
+```{r}
+library(ggplot2)
+library(ggrepel)
+library(reshape2)
+library(ggsci)
+library(dplyr)
+#male:
+male <- read.table("~/Desktop/MendelianRandomization_BMI/Analysis/Data/Mice Data/HHH/male/HHH_male.csv",header = T,sep = ",",check.names = F)
+male$ID <- paste(male$Cage,male$`Animal number`,round(male$Fat/male$Weight,2),sep = "-")
+colnames(male) <- c(colnames(male)[1:8],paste("ITT",colnames(male)[9:14],sep = "-"),paste("GTT",colnames(male)[15:19],sep = "-"),paste("Glucose",colnames(male)[20:30],sep = "-"),paste("Weight",colnames(male)[31:51],sep = "-"),colnames(male)[52:61])
+male$Genotyping_2 <- ifelse(male$Genotyping=="WT","WT",ifelse(grepl("TgPNPLA3-Mut",male$Genotyping),"PNPLA3-Mut","PNPLA3-WT"))
+
+
+
+###Mice selection
+#based on the fat/weight ratio, there seems to be two sub-groups within the WT mice. One group with higher fat (~30%), the other
+#group contains less fat (< 30%). We belive the first group would be the normal WT mice, while the second 
+#group mainly were mainly breeded from the same cages as the PNPLA3-Mut.
+selected <- (!(((male$Genotyping_2=="WT")&(male$Fat/male$Weight < 0.3))|(male$Genotyping=="TgPNPLA3-Mut-F3")))
+male <- male[selected,]
+
+#combine with extra measurement
+male2 <- read.table("~/Desktop/MendelianRandomization_BMI/Analysis/Data/Mice Data/HHH/male/HHH_male_extra.csv",header = T,sep = ",",check.names = F)
+male$ID <- paste(male$Cage,male$`Animal number`,male$Genotyping,sep = "_")
+
+sum(male$ID==male2$id)
+male <- cbind(male,male2[,-(1:4)])
+
+# WT <- male[male$Genotyping=="WT",]
+# PNPLA3_Mut <- male[grep("TgPNPLA3-Mut",male$Genotyping),]
+# PNPLA3_WT <- male[grep("TgPNPLA3-WT",male$Genotyping),]
+
+#PCA of all data
+PCA <- prcomp(male[,-c(1:5,62)],scale. = T)
+plot(PCA$x[,1],PCA$x[,2])
+PCA$sdev^2/sum(PCA$sdev^2) *100
+ggplot() + geom_point(aes(x = PCA$x[,1],y = PCA$x[,2],colour = male$Genotyping_2)) + geom_text_repel(aes(x = PCA$x[,1],y = PCA$x[,2],label=male$ID)) + xlab("PC1 of all variables") + ylab("PC2 of all variables") + ggtitle("Male mice of HHH diet") + scale_color_discrete(name = "genotype") + theme_bw()
+ 
+
+#normalize the tissue weight by total weight
+male$Fat_prop <- male$Fat/male$Weight
+male$Lean_prop <- male$Lean/male$Weight
+male$Subcutaneous_total <- male[,54] + male[,55]
+
+#male[,62:67] <- male[,53:58]/male[,52] normalize tissue weight by body weight
+
+
+#melt the data before aggregate
+male_2 <- melt(male,measure.vars = colnames(male)[-c(1:5,62)])
+
+stderr <- function(x, na.rm=FALSE) {
+  if (na.rm) x <- na.omit(x)
+  sqrt(var(x)/length(x))
+}
+average <- aggregate(value ~ Genotyping_2 + variable,male_2, mean)
+se <- aggregate(value ~ Genotyping_2 + variable,male_2, stderr)
+dt <- cbind(average[,c(1:2)],"Mean" = average$value, "Stderr" = se$value)
+# ###statistical test: lmm, repeated measure two way ANOVA
+# library(nlme)
+# #t test
+# t_test <- list()
+# for (variable in colnames(male)[-c(1:5,59)]){
+#   t_test[[variable]] <- t.test(PNPLA3_Mut[,variable],PNPLA3_WT[,variable])
+# }
+# p_value <- unlist(lapply(t_test,`[[`,3))
+# p_value
+# #anova 
+# weight <- melt(male,measure.vars = colnames(male)[31:51],variable.name = "Body_weight_time",value.name = "Body_weight") 
+# boxplot(weight$Body_weight ~ weight$Genotyping_2 + weight$Body_weight_time)
+# 
+# fit.weight <- lm(weight$Body_weight ~ weight$Genotyping_2 + weight$Body_weight_time + weight$Genotyping_2 * weight$Body_weight_time)
+# anova(fit.weight)
+# 
+# summary(aov(weight$Body_weight ~ weight$Genotyping_2 + weight$Body_weight_time  + weight$Genotyping_2 * weight$Body_weight_time + Error(weight$ID/weight$Body_weight_time)))
+# 
+# 
+# anova(lme(Body_weight ~ Genotyping_2, random=~ID+Body_weight_time, data=weight))
+# 
+# fit.glucose <- lm(glucose$Glucose ~ glucose$Genotyping_2 + glucose$`Glucose-time` + glucose$Genotyping_2 * glucose$Glucose)
+# anova(fit.glucose)
+#############################################################################################
+###plot
+#Glucose
+tiff("~/Desktop/glucose.tiff",width = 6, height = 4 ,units = "in", res = 300)
+ggplot(data = dt[grep("Glucose-",dt$variable),]) + geom_line(aes(x = variable,y = Mean, group = Genotyping_2,col = Genotyping_2)) + geom_errorbar(aes(x = variable, ymin = Mean - Stderr, ymax = Mean + Stderr, col = Genotyping_2),width = 0.25) + theme_bw() +  scale_color_npg(name = "Genotype") +
+  coord_cartesian(ylim = c(120,250)) + xlab("Time (week)") + ylab("Glucose level (mg/dL)") + scale_x_discrete(labels=seq(0,20,2)) 
+# + geom_text(data = dt %>% filter((Genotyping_2=="PNPLA3-Mut")&(variable %in% c("Glucose-16","Glucose-18"))), aes(x = variable, y = Mean + Stderr + 3, label = "*"))
+dev.off()
+#GTT
+tiff("~/Desktop/GTT.tiff",width = 6, height = 4 ,units = "in", res = 300)
+ggplot(data = dt[grep("GTT-",dt$variable),]) + geom_line(aes(x = variable,y = Mean, group = Genotyping_2,col = Genotyping_2)) + 
+  geom_errorbar(aes(x = variable, ymin = Mean - Stderr, ymax = Mean + Stderr, col = Genotyping_2),width=0.25) + theme_bw() +  scale_color_npg(name = "Genotype") +
+  xlab("Time (min)") + ylab("Glucose level (mg/dL)") + scale_x_discrete(labels=c(0,15,30,60,120)) + coord_cartesian(ylim = c(120,600)) 
+dev.off()
+#ITT
+tiff("~/Desktop/ITT.tiff",width = 6, height = 4 ,units = "in", res = 300)
+ggplot(data = dt[grep("ITT-",dt$variable),]) + geom_line(aes(x = variable,y = Mean, group = Genotyping_2,col = Genotyping_2)) + 
+  geom_errorbar(aes(x = variable, ymin = Mean - Stderr, ymax = Mean + Stderr, col = Genotyping_2),width=0.25) + theme_bw() +  scale_color_npg(name = "Genotype") +
+  xlab("Time (min)") + ylab("Glucose level (mg/dL)") + scale_x_discrete(labels=c(0,15,30,60,120,240)) 
+dev.off()
+
+#Insulin
+#tiff("~/Desktop/ITT.tiff",width = 6, height = 4 ,units = "in", res = 300)
+ggplot(data = dt[grep("ins_",dt$variable),]) + geom_line(aes(x = variable,y = Mean, group = Genotyping_2,col = Genotyping_2)) + 
+  geom_errorbar(aes(x = variable, ymin = Mean - Stderr, ymax = Mean + Stderr, col = Genotyping_2),width=0.25) + theme_bw() +  scale_color_npg(name = "Genotype") +
+  xlab("Time (week)") + ylab("Insulin level (pM)") + scale_x_discrete(labels=c(0,4,8,12,16,18,20))  + coord_cartesian(ylim = c(100,300))
+#dev.off()
+
+
+#HOMA-IR
+#tiff("~/Desktop/ITT.tiff",width = 6, height = 4 ,units = "in", res = 300)
+ggplot(data = dt[grep("HOMA_IR_",dt$variable),]) + geom_line(aes(x = variable,y = Mean, group = Genotyping_2,col = Genotyping_2)) + 
+  geom_errorbar(aes(x = variable, ymin = Mean - Stderr, ymax = Mean + Stderr, col = Genotyping_2),width=0.25) + theme_bw() +  scale_color_npg(name = "Genotype") +
+  xlab("Time (week)") + ylab("HOMA-IR") + scale_x_discrete(labels=c(0,4,8,12,16,18,20)) + coord_cartesian(ylim = c(2,6))
+#dev.off()
+
+#HOMA-B
+#tiff("~/Desktop/ITT.tiff",width = 6, height = 4 ,units = "in", res = 300)
+ggplot(data = dt[grep("HOMA_B_",dt$variable),]) + geom_line(aes(x = variable,y = Mean, group = Genotyping_2,col = Genotyping_2)) + 
+  geom_errorbar(aes(x = variable, ymin = Mean - Stderr, ymax = Mean + Stderr, col = Genotyping_2),width=0.25) + theme_bw() +  scale_color_npg(name = "Genotype") +
+  xlab("Time (week)") + ylab("HOMA-B") + scale_x_discrete(labels=c(0,4,8,12,16,18,20)) + coord_cartesian(ylim = c(40,110))
+#dev.off()
+
+#HOMA-S
+#tiff("~/Desktop/ITT.tiff",width = 6, height = 4 ,units = "in", res = 300)
+ggplot(data = dt[grep("HOMA_S_",dt$variable),]) + geom_line(aes(x = variable,y = Mean, group = Genotyping_2,col = Genotyping_2)) + 
+  geom_errorbar(aes(x = variable, ymin = Mean - Stderr, ymax = Mean + Stderr, col = Genotyping_2),width=0.25) + theme_bw() +  scale_color_npg(name = "Genotype") +
+  xlab("Time (week)") + ylab("HOMA-S") + scale_x_discrete(labels=c(0,4,8,12,16,18,20)) + coord_cartesian(ylim = c(15,35))
+#dev.off()
+
+
+#body weight
+#reorgranize the color
+dt$Genotyping_2 <- factor(dt$Genotyping_2,levels = c("WT","PNPLA3-WT","PNPLA3-Mut"))
+#pal_npg()(3) # "#E64B35FF" for PNPLA3-Mut, "#4DBBD5FF" for PNPLA3-WT, and "#00A087FF" for WT
+my_pal <- c("#00A087FF", "#4DBBD5FF", "#E64B35FF")
+
+tiff("~/Desktop/weight.tiff",width = 6, height = 4 ,units = "in", res = 300)
+ggplot(data = dt[grep("Weight-",dt$variable),]) + geom_line(aes(x = variable,y = Mean, group = Genotyping_2,col = Genotyping_2)) + geom_errorbar(aes(x = variable, ymin = Mean - Stderr, ymax = Mean + Stderr, col = Genotyping_2),width = 0.25) + theme_bw()  + scale_x_discrete(labels=0:20) + xlab("Time (week)") + ylab("Body weight (g)") + scale_color_manual(values=my_pal)
+dev.off()
+
+
+#MRi with raw body weight
+tiff("~/Desktop/mri_raw.tiff",width = 6, height = 4 ,units = "in", res = 300)
+ggplot(data = dt[1:6,]) +geom_bar(aes(x = variable, y = Mean, fill = Genotyping_2),width = 0.5,stat = "Identity",position = position_dodge()) + geom_errorbar(aes(x = variable, ymin = Mean - Stderr, ymax = Mean + Stderr,col = Genotyping_2),width = 0.5,position = position_dodge()) +scale_fill_manual(name = "Genotype",values = my_pal) + scale_color_manual(values = my_pal,guide = F) + xlab("") + ylab("Body weight (g)") + theme_bw() 
+dev.off()
+
+#MRi with proportion
+tiff("~/Desktop/mri_pro.tiff",width = 6, height = 4 ,units = "in", res = 300)
+ggplot(data = dt[160:165,]) +geom_bar(aes(x = variable, y = Mean, fill = Genotyping_2),width = 0.5,stat = "Identity",position = position_dodge()) + geom_errorbar(aes(x = variable, ymin = Mean - Stderr, ymax = Mean + Stderr,col = Genotyping_2),width = 0.5,position = position_dodge()) +scale_fill_manual(name = "Genotype",values = my_pal) + scale_color_manual(values = my_pal,guide = F) + xlab("") + ylab("Proportion of body weight") + theme_bw() + scale_x_discrete(labels=c("Fat","Lean"))
+dev.off()
+
+
+#tissue weight distribution with raw weight
+#reorder the tissues 
+dt$variable <- as.character(dt$variable)
+tmp_df <- dt[c(142:144,151:156,316:318),]
+tmp_df$variable <- factor(tmp_df$variable,levels = c("Liver weight","Subcutaneous_total","Epididymis WAT","BAT"))
+
+tiff("~/Desktop/tissue_raw.tiff",width = 6, height = 4 ,units = "in", res = 300)
+ggplot(data = tmp_df) + geom_bar(aes(x = as.factor(variable), y = Mean, fill = as.factor(Genotyping_2)), width = 0.5,stat = "Identity",position=position_dodge(0.5)) +  geom_errorbar(aes(x = variable, ymin = Mean - Stderr, ymax = Mean + Stderr,col = Genotyping_2),width = 0.5, position=position_dodge(0.5))+ scale_fill_manual(name = NULL,values = my_pal) + scale_color_manual(guide = F,values = my_pal) + xlab("") + ylab("Weight (g)") + theme_bw() + scale_x_discrete(labels = c("Liver","Subcutaneous fat","EWAT","BAT"))
+dev.off()
+
+#tissue weight distribution with proportion
+tiff("~/Desktop/tissue_prop.tiff",width = 6, height = 4 ,units = "in", res = 300)
+ggplot(data = dt[166:180,]) + geom_bar(aes(x = as.factor(variable), y = Mean, fill = as.factor(Genotyping_2)), width = 0.5,stat = "Identity",position=position_dodge(0.5)) +  geom_errorbar(aes(x = variable, ymin = Mean - Stderr, ymax = Mean + Stderr,col = Genotyping_2),width = 0.5, position=position_dodge(0.5))+ scale_fill_manual(name = NULL,values = my_pal) + scale_color_manual(guide = F,values = my_pal) + xlab("") + ylab("Proportion of body weight") + theme_bw() 
+dev.off()
+
+
+#serum TC
+#tiff("~/Desktop/weight.tiff",width = 6, height = 4 ,units = "in", res = 300)
+tmp <- dt[grep("TC",dt$variable),]
+tmp$variable <- factor(dt[grep("TC",dt$variable),]$variable,levels = c("TC_0","TC_4","TC_8","TC_12","TC_16","TC_18","TC_20"))
+ggplot(data = tmp) + geom_line(aes(x = variable,y = Mean, group = Genotyping_2,col = Genotyping_2)) + geom_errorbar(aes(x = variable, ymin = Mean - Stderr, ymax = Mean + Stderr, col = Genotyping_2),width = 0.25) + theme_bw()  + scale_x_discrete(labels=c(0,4,8,12,16,18,20)) + xlab("Time (week)") + ylab("Serum total cholesterol (mg/dL)") + scale_color_manual(values=my_pal)
+#dev.off()
+
+#serum TG
+#tiff("~/Desktop/weight.tiff",width = 6, height = 4 ,units = "in", res = 300)
+tmp <- dt[grep("TG",dt$variable),]
+tmp$variable <- factor(dt[grep("TG",dt$variable),]$variable,levels = c("TG_0","TG_4","TG_8","TG_12","TG_16","TG_18","TG_20"))
+ggplot(data = tmp) + geom_line(aes(x = variable,y = Mean, group = Genotyping_2,col = Genotyping_2)) + geom_errorbar(aes(x = variable, ymin = Mean - Stderr, ymax = Mean + Stderr, col = Genotyping_2),width = 0.25) + theme_bw()  + scale_x_discrete(labels=c(0,4,8,12,16,18,20)) + xlab("Time (week)") + ylab("Serum Tg level (mg/dL)") + scale_color_manual(values=my_pal) + coord_cartesian(ylim = c(20,100))
+#dev.off()
+
+```
+
+###HSD diet male
+```{r}
+hsd_male <- read.table("Data/Mice Data/HSD/HSD-data.csv",header = T,sep = ",")
+PCA_hsd <- prcomp(hsd_male[,-c(1,2)],scale. = T)
+plot(PCA_hsd$x[,1],PCA_hsd$x[,2])
+PCA_hsd$sdev^2/sum(PCA_hsd$sdev^2) *100
+ggplot() + geom_point(aes(x = PCA_hsd$x[,1],y = PCA_hsd$x[,2],colour = hsd_male$genotype)) + geom_text_repel(aes(x = PCA_hsd$x[,1],y = PCA_hsd$x[,2],label=paste(hsd_male$genotype,hsd_male$id,sep = "_"))) + xlab("PC1 of all variables") + ylab("PC2 of all variables") + ggtitle("Male mice of HSD diet") + scale_color_discrete(name = "genotype") + theme_bw()
+```
+
